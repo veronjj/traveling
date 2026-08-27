@@ -9,7 +9,7 @@
  *       desde GET /.
  *
  *  INSTALACIÓN Y EJECUCIÓN
- *    npm install express mysql2 dotenv
+ *    npm install express mysql2 dotenv web-push
  *    node index.js
  *
  *  VARIABLES DE ENTORNO (crea un archivo .env junto a este archivo)
@@ -20,7 +20,16 @@
  *    DB_PORT      Puerto (por defecto 3306)
  *    DB_SSL       "true" si tu proveedor exige SSL (PlanetScale, Aiven, etc.)
  *    PORT         Puerto HTTP del servidor (por defecto 3000)
- *    SESSION_SECRET  Cadena secreta para firmar las sesiones (obligatoria en producción)
+ *    SESSION_SECRET     Cadena secreta para firmar las sesiones (obligatoria en producción)
+ *    VAPID_PUBLIC_KEY   Clave pública para notificaciones push del navegador
+ *    VAPID_PRIVATE_KEY  Clave privada para notificaciones push del navegador
+ *    VAPID_SUBJECT      Contacto del remitente, ej. mailto:tucorreo@ejemplo.com
+ *
+ *  Genera el par de claves VAPID una sola vez con:
+ *    node -e "console.log(require('web-push').generateVAPIDKeys())"
+ *
+ *  Sin esas 3 variables, la app funciona igual mas las notificaciones push
+ *  quedan desactivadas silenciosamente (no rompe nada, solo no notifica).
  *
  *  La base de datos inicia completamente vacía: no hay usuarios, viajes ni
  *  reservas de ejemplo. Todo se crea desde la interfaz.
@@ -34,6 +43,7 @@ require('dotenv').config();
 const express = require('express');
 const mysql = require('mysql2/promise');
 const crypto = require('crypto');
+const webpush = require('web-push');
 
 // -----------------------------------------------------------------------------
 // 1. CONFIGURACIÓN GENERAL
@@ -51,6 +61,22 @@ if (!process.env.SESSION_SECRET) {
 }
 const SESSION_SECRET = process.env.SESSION_SECRET || crypto.randomBytes(48).toString('hex');
 const DURACION_SESION_MS = 7 * 24 * 60 * 60 * 1000; // 7 días
+
+// Notificaciones push (Web Push). Si faltan las claves, la app sigue
+// funcionando normal y las notificaciones simplemente no se envían.
+const PUSH_HABILITADO = Boolean(process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY);
+if (PUSH_HABILITADO) {
+  webpush.setVapidDetails(
+    process.env.VAPID_SUBJECT || 'mailto:soporte@traveling.app',
+    process.env.VAPID_PUBLIC_KEY,
+    process.env.VAPID_PRIVATE_KEY
+  );
+} else {
+  console.warn(
+    '[Traveling] Advertencia: faltan VAPID_PUBLIC_KEY/VAPID_PRIVATE_KEY en tu .env. ' +
+    'Las notificaciones push quedan desactivadas hasta que las configures.'
+  );
+}
 
 // -----------------------------------------------------------------------------
 // 2. CONEXIÓN A BASE DE DATOS (MySQL en la nube vía variables de entorno)
@@ -125,6 +151,45 @@ async function inicializarBaseDeDatos() {
       '  INDEX idx_pasajero (pasajero_id)' +
       ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
     );
+
+    await conexion.query(
+      'CREATE TABLE IF NOT EXISTS push_suscripciones (' +
+      '  id INT AUTO_INCREMENT PRIMARY KEY,' +
+      '  usuario_id INT NOT NULL,' +
+      '  endpoint VARCHAR(500) NOT NULL,' +
+      '  p256dh VARCHAR(255) NOT NULL,' +
+      '  auth VARCHAR(255) NOT NULL,' +
+      '  creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+      '  UNIQUE KEY uq_endpoint (endpoint(255)),' +
+      '  CONSTRAINT fk_push_usuario FOREIGN KEY (usuario_id) REFERENCES usuarios(id) ON DELETE CASCADE,' +
+      '  INDEX idx_push_usuario (usuario_id)' +
+      ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+    );
+
+    await conexion.query(
+      'CREATE TABLE IF NOT EXISTS avisos_cupo (' +
+      '  id INT AUTO_INCREMENT PRIMARY KEY,' +
+      '  viaje_id INT NOT NULL,' +
+      '  pasajero_id INT NOT NULL,' +
+      '  creado_en TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,' +
+      '  UNIQUE KEY uq_aviso (viaje_id, pasajero_id),' +
+      '  CONSTRAINT fk_aviso_viaje FOREIGN KEY (viaje_id) REFERENCES viajes(id) ON DELETE CASCADE,' +
+      '  CONSTRAINT fk_aviso_pasajero FOREIGN KEY (pasajero_id) REFERENCES usuarios(id) ON DELETE CASCADE' +
+      ') ENGINE=InnoDB DEFAULT CHARSET=utf8mb4'
+    );
+
+    // Migración suave: si "viajes" ya existía de una versión anterior (sin
+    // pico y placa), le añade la columna sin tocar los datos existentes.
+    const [columnas] = await conexion.query(
+      'SELECT COLUMN_NAME FROM information_schema.columns WHERE table_schema = DATABASE() AND table_name = ? AND column_name = ?',
+      ['viajes', 'pico_y_placa']
+    );
+    if (columnas.length === 0) {
+      await conexion.query(
+        'ALTER TABLE viajes ADD COLUMN pico_y_placa BOOLEAN NOT NULL DEFAULT FALSE AFTER hora_salida'
+      );
+      console.log('[Traveling] Migración aplicada: columna viajes.pico_y_placa añadida.');
+    }
 
     console.log('[Traveling] Tablas verificadas/creadas correctamente (base de datos vacía, sin datos de ejemplo).');
   } finally {
@@ -206,6 +271,37 @@ const REGEX_EMAIL = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const REGEX_FECHA = /^\d{4}-\d{2}-\d{2}$/;
 const REGEX_HORA = /^\d{2}:\d{2}(:\d{2})?$/;
 
+// Días de la semana: el índice coincide con Date.getDay() (0 = domingo).
+const DIAS_SEMANA = ['DOM', 'LUN', 'MAR', 'MIE', 'JUE', 'VIE', 'SAB'];
+const SEMANAS_A_GENERAR = 4; // cuántas semanas hacia adelante se publican de una vez
+
+function diaValido(codigo) {
+  return DIAS_SEMANA.indexOf(codigo) !== -1;
+}
+
+/**
+ * Dada una lista de códigos de día (['LUN','MIE']) devuelve, para las
+ * próximas SEMANAS_A_GENERAR semanas empezando mañana, las fechas
+ * (YYYY-MM-DD) cuyo día de la semana coincide.
+ */
+function generarFechasParaDias(codigosDias) {
+  const fechas = [];
+  const hoy = new Date();
+  hoy.setHours(0, 0, 0, 0);
+  const totalDias = SEMANAS_A_GENERAR * 7;
+  for (let i = 1; i <= totalDias; i++) {
+    const fecha = new Date(hoy.getTime() + i * 24 * 60 * 60 * 1000);
+    const codigoDia = DIAS_SEMANA[fecha.getDay()];
+    if (codigosDias.indexOf(codigoDia) !== -1) {
+      const anio = fecha.getFullYear();
+      const mes = String(fecha.getMonth() + 1).padStart(2, '0');
+      const dia = String(fecha.getDate()).padStart(2, '0');
+      fechas.push(anio + '-' + mes + '-' + dia);
+    }
+  }
+  return fechas;
+}
+
 function textoValido(valor, min, max) {
   return typeof valor === 'string' && valor.trim().length >= min && valor.trim().length <= max;
 }
@@ -260,6 +356,43 @@ function requiereRol(rol) {
     }
     next();
   };
+}
+
+// Igual que "autenticar" pero no falla si no hay token: solo adjunta
+// req.usuario cuando el token es válido. Útil para endpoints públicos que
+// personalizan la respuesta cuando el visitante sí inició sesión.
+function autenticarOpcional(req, res, next) {
+  const encabezado = req.headers.authorization || '';
+  const token = encabezado.startsWith('Bearer ') ? encabezado.slice(7) : null;
+  const datos = verificarToken(token);
+  req.usuario = datos || null;
+  next();
+}
+
+/**
+ * Envía una notificación push a todas las suscripciones activas de un
+ * usuario. Si las claves VAPID no están configuradas, no hace nada. Si una
+ * suscripción ya no es válida (el navegador la revocó), la borra sola.
+ */
+async function enviarNotificacionAUsuario(usuarioId, payload) {
+  if (!PUSH_HABILITADO) return;
+  try {
+    const [suscripciones] = await pool.query('SELECT * FROM push_suscripciones WHERE usuario_id = ?', [usuarioId]);
+    for (const s of suscripciones) {
+      const suscripcion = { endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } };
+      try {
+        await webpush.sendNotification(suscripcion, JSON.stringify(payload));
+      } catch (err) {
+        if (err && (err.statusCode === 404 || err.statusCode === 410)) {
+          await pool.query('DELETE FROM push_suscripciones WHERE id = ?', [s.id]);
+        } else {
+          console.error('[Traveling] Error enviando notificación push:', err && err.message);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[Traveling] Error consultando suscripciones push:', err.message);
+  }
 }
 
 // -----------------------------------------------------------------------------
@@ -393,10 +526,19 @@ app.post('/api/viajes', autenticar, requiereRol('conductor'), manejadorAsincrono
   const cuerpo = req.body || {};
   const origen = String(cuerpo.origen || '').trim();
   const destino = String(cuerpo.destino || '').trim();
-  const fechaSalida = String(cuerpo.fecha_salida || '').trim();
   const horaSalida = String(cuerpo.hora_salida || '').trim();
   const puestosDisponibles = cuerpo.puestos_disponibles;
   const precio = cuerpo.precio;
+
+  // dias_semana / pico_placa_dias llegan como array (checkboxes) o como un
+  // único string si solo se marcó una casilla — normalizamos a array.
+  let diasSemana = cuerpo.dias_semana || [];
+  if (!Array.isArray(diasSemana)) diasSemana = [diasSemana];
+  diasSemana = diasSemana.filter(diaValido);
+
+  let diasPicoPlaca = cuerpo.pico_placa_dias || [];
+  if (!Array.isArray(diasPicoPlaca)) diasPicoPlaca = [diasPicoPlaca];
+  diasPicoPlaca = diasPicoPlaca.filter(diaValido);
 
   if (!textoValido(origen, 2, 150) || !textoValido(destino, 2, 150)) {
     return res.status(400).json({ ok: false, mensaje: 'Ingresa el origen y el destino del viaje.' });
@@ -404,15 +546,15 @@ app.post('/api/viajes', autenticar, requiereRol('conductor'), manejadorAsincrono
   if (origen.trim().toLowerCase() === destino.trim().toLowerCase()) {
     return res.status(400).json({ ok: false, mensaje: 'El origen y el destino no pueden ser el mismo lugar.' });
   }
-  if (!REGEX_FECHA.test(fechaSalida)) {
-    return res.status(400).json({ ok: false, mensaje: 'Ingresa una fecha de salida válida.' });
-  }
   if (!REGEX_HORA.test(horaSalida)) {
     return res.status(400).json({ ok: false, mensaje: 'Ingresa una hora de salida válida.' });
   }
-  const hoy = new Date().toISOString().slice(0, 10);
-  if (fechaSalida < hoy) {
-    return res.status(400).json({ ok: false, mensaje: 'La fecha de salida no puede ser anterior a hoy.' });
+  if (diasSemana.length === 0) {
+    return res.status(400).json({ ok: false, mensaje: 'Selecciona al menos un día de la semana en que circulas.' });
+  }
+  const diasEnComun = diasSemana.filter((d) => diasPicoPlaca.indexOf(d) !== -1);
+  if (diasEnComun.length > 0) {
+    return res.status(400).json({ ok: false, mensaje: 'Un día no puede ser a la vez día de circulación y día de pico y placa.' });
   }
   if (!enteroPositivo(puestosDisponibles)) {
     return res.status(400).json({ ok: false, mensaje: 'Ingresa una cantidad válida de puestos disponibles.' });
@@ -430,20 +572,42 @@ app.post('/api/viajes', autenticar, requiereRol('conductor'), manejadorAsincrono
     });
   }
 
-  const [resultado] = await pool.query(
-    'INSERT INTO viajes (conductor_id, origen, destino, fecha_salida, hora_salida, puestos_disponibles, puestos_totales, precio) VALUES (?,?,?,?,?,?,?,?)',
-    [req.usuario.id, origen, destino, fechaSalida, horaSalida, Number(puestosDisponibles), Number(puestosDisponibles), Number(precio)]
+  const fechasCirculacion = generarFechasParaDias(diasSemana);
+  const fechasPicoPlaca = diasPicoPlaca.length ? generarFechasParaDias(diasPicoPlaca) : [];
+
+  if (fechasCirculacion.length === 0) {
+    return res.status(400).json({ ok: false, mensaje: 'No se pudo generar ninguna fecha con esos días. Intenta de nuevo.' });
+  }
+
+  const filasAInsertar = [];
+  for (const fecha of fechasCirculacion) {
+    filasAInsertar.push([req.usuario.id, origen, destino, fecha, horaSalida, Number(puestosDisponibles), Number(puestosDisponibles), Number(precio), false]);
+  }
+  for (const fecha of fechasPicoPlaca) {
+    filasAInsertar.push([req.usuario.id, origen, destino, fecha, horaSalida, 0, Number(puestosDisponibles), Number(precio), true]);
+  }
+
+  await pool.query(
+    'INSERT INTO viajes (conductor_id, origen, destino, fecha_salida, hora_salida, puestos_disponibles, puestos_totales, precio, pico_y_placa) VALUES ?',
+    [filasAInsertar]
   );
 
-  res.status(201).json({ ok: true, mensaje: 'Viaje publicado correctamente.', id: resultado.insertId });
+  res.status(201).json({
+    ok: true,
+    mensaje: `Viaje publicado: se generaron ${fechasCirculacion.length} salida(s) en las próximas ${SEMANAS_A_GENERAR} semanas.`,
+    totalGenerado: fechasCirculacion.length,
+  });
 }));
 
-app.get('/api/viajes', manejadorAsincrono(async (req, res) => {
+app.get('/api/viajes', autenticarOpcional, manejadorAsincrono(async (req, res) => {
   const origen = String(req.query.origen || '').trim();
   const destino = String(req.query.destino || '').trim();
   const fecha = String(req.query.fecha || '').trim();
 
-  const condiciones = ["v.estado = 'activo'", 'v.puestos_disponibles > 0'];
+  // Se muestran todos los viajes activos, incluso los llenos: así el
+  // pasajero puede pedir que le avisen si se libera un puesto. El frontend
+  // distingue "lleno", "en pico y placa" y "con cupo" con el mismo listado.
+  const condiciones = ["v.estado = 'activo'"];
   const parametros = [];
 
   if (origen) {
@@ -463,16 +627,18 @@ app.get('/api/viajes', manejadorAsincrono(async (req, res) => {
     parametros.push(hoy);
   }
 
+  const pasajeroId = req.usuario ? req.usuario.id : 0;
   const sql =
-    'SELECT v.id, v.origen, v.destino, v.fecha_salida, v.hora_salida, v.puestos_disponibles, v.puestos_totales, v.precio, v.estado, ' +
+    'SELECT v.id, v.origen, v.destino, v.fecha_salida, v.hora_salida, v.puestos_disponibles, v.puestos_totales, v.precio, v.estado, v.pico_y_placa, ' +
     '       u.id AS conductor_id, u.nombre AS conductor_nombre, u.telefono AS conductor_telefono, ' +
-    '       u.vehiculo_modelo, u.vehiculo_placa ' +
+    '       u.vehiculo_modelo, u.vehiculo_placa, ' +
+    '       EXISTS(SELECT 1 FROM avisos_cupo a WHERE a.viaje_id = v.id AND a.pasajero_id = ?) AS tiene_aviso ' +
     'FROM viajes v JOIN usuarios u ON v.conductor_id = u.id ' +
     'WHERE ' + condiciones.join(' AND ') + ' ' +
     'ORDER BY v.fecha_salida ASC, v.hora_salida ASC ' +
     'LIMIT 100';
 
-  const [filas] = await pool.query(sql, parametros);
+  const [filas] = await pool.query(sql, [pasajeroId, ...parametros]);
   res.json({ ok: true, viajes: filas });
 }));
 
@@ -596,6 +762,13 @@ app.post('/api/viajes/:id/reservar', autenticar, requiereRol('pasajero'), maneja
 
     await conexion.commit();
     res.status(201).json({ ok: true, mensaje: '¡Reserva confirmada! El conductor verá tu punto de recogida.' });
+
+    // Aviso al conductor (no bloquea la respuesta si falla).
+    enviarNotificacionAUsuario(viaje.conductor_id, {
+      titulo: 'Nueva reserva en Traveling',
+      cuerpo: `${req.usuario.nombre} reservó ${puestos} puesto(s) en tu viaje ${viaje.origen} → ${viaje.destino}.`,
+      url: '/',
+    });
   } catch (err) {
     await conexion.rollback();
     throw err;
@@ -645,13 +818,27 @@ app.patch('/api/reservas/:id/cancelar', autenticar, requiereRol('pasajero'), man
 
     const [filasViaje] = await conexion.query('SELECT * FROM viajes WHERE id = ? FOR UPDATE', [reserva.viaje_id]);
     const viaje = filasViaje[0];
+    let seLiberoCupo = false;
     if (viaje && viaje.estado === 'activo') {
       const restaurados = Math.min(viaje.puestos_totales, viaje.puestos_disponibles + reserva.puestos_reservados);
       await conexion.query('UPDATE viajes SET puestos_disponibles = ? WHERE id = ?', [restaurados, viaje.id]);
+      seLiberoCupo = restaurados > 0;
     }
 
     await conexion.commit();
     res.json({ ok: true, mensaje: 'Reserva cancelada correctamente.' });
+
+    // Avisa a quienes pidieron que les avisaran de cupo en este viaje.
+    if (seLiberoCupo) {
+      const [interesados] = await pool.query('SELECT pasajero_id FROM avisos_cupo WHERE viaje_id = ?', [viaje.id]);
+      for (const interesado of interesados) {
+        enviarNotificacionAUsuario(interesado.pasajero_id, {
+          titulo: '¡Hay cupo disponible!',
+          cuerpo: `Se liberó un puesto en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
+          url: '/',
+        });
+      }
+    }
   } catch (err) {
     await conexion.rollback();
     throw err;
@@ -659,6 +846,100 @@ app.patch('/api/reservas/:id/cancelar', autenticar, requiereRol('pasajero'), man
     conexion.release();
   }
 }));
+
+// -----------------------------------------------------------------------------
+// 8.5 RUTAS API — NOTIFICACIONES PUSH
+// -----------------------------------------------------------------------------
+
+app.get('/api/notificaciones/clave-publica', (req, res) => {
+  res.json({ ok: true, clavePublica: PUSH_HABILITADO ? process.env.VAPID_PUBLIC_KEY : null });
+});
+
+app.post('/api/notificaciones/suscribir', autenticar, manejadorAsincrono(async (req, res) => {
+  const cuerpo = req.body || {};
+  const endpoint = String(cuerpo.endpoint || '').trim();
+  const claves = cuerpo.keys || {};
+  const p256dh = String(claves.p256dh || '').trim();
+  const auth = String(claves.auth || '').trim();
+
+  if (!endpoint || !p256dh || !auth) {
+    return res.status(400).json({ ok: false, mensaje: 'Suscripción de notificaciones inválida.' });
+  }
+
+  await pool.query(
+    'INSERT INTO push_suscripciones (usuario_id, endpoint, p256dh, auth) VALUES (?,?,?,?) ' +
+    'ON DUPLICATE KEY UPDATE usuario_id = VALUES(usuario_id), p256dh = VALUES(p256dh), auth = VALUES(auth)',
+    [req.usuario.id, endpoint, p256dh, auth]
+  );
+
+  res.status(201).json({ ok: true, mensaje: 'Notificaciones activadas.' });
+}));
+
+app.post('/api/viajes/:id/avisar-cupo', autenticar, requiereRol('pasajero'), manejadorAsincrono(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!enteroPositivo(id)) return res.status(400).json({ ok: false, mensaje: 'Viaje inválido.' });
+
+  await pool.query(
+    'INSERT IGNORE INTO avisos_cupo (viaje_id, pasajero_id) VALUES (?, ?)',
+    [id, req.usuario.id]
+  );
+
+  res.status(201).json({ ok: true, mensaje: 'Listo, te avisaremos si se libera un puesto en este viaje.' });
+}));
+
+app.delete('/api/viajes/:id/avisar-cupo', autenticar, requiereRol('pasajero'), manejadorAsincrono(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!enteroPositivo(id)) return res.status(400).json({ ok: false, mensaje: 'Viaje inválido.' });
+
+  await pool.query('DELETE FROM avisos_cupo WHERE viaje_id = ? AND pasajero_id = ?', [id, req.usuario.id]);
+
+  res.json({ ok: true, mensaje: 'Aviso cancelado.' });
+}));
+
+// -----------------------------------------------------------------------------
+// 8.6 SERVICE WORKER (necesario para notificaciones push del navegador)
+// -----------------------------------------------------------------------------
+
+const SERVICE_WORKER_JS = `self.addEventListener('install', function (event) {
+  self.skipWaiting();
+});
+
+self.addEventListener('activate', function (event) {
+  event.waitUntil(self.clients.claim());
+});
+
+self.addEventListener('push', function (event) {
+  var datos = {};
+  try {
+    datos = event.data ? event.data.json() : {};
+  } catch (err) {
+    datos = { titulo: 'Traveling', cuerpo: 'Tienes una novedad.' };
+  }
+
+  var opciones = {
+    body: datos.cuerpo || '',
+    icon: undefined,
+    badge: undefined,
+    data: { url: datos.url || '/' }
+  };
+
+  event.waitUntil(
+    self.registration.showNotification(datos.titulo || 'Traveling', opciones).then(function () {
+      return self.clients.matchAll({ type: 'window' }).then(function (listaClientes) {
+        listaClientes.forEach(function (cliente) {
+          cliente.postMessage({ tipo: 'notificacion-push', payload: datos });
+        });
+      });
+    })
+  );
+});
+
+self.addEventListener('notificationclick', function (event) {
+  event.notification.close();
+  var url = (event.notification.data && event.notification.data.url) || '/';
+  event.waitUntil(self.clients.openWindow(url));
+});
+`;
 
 // -----------------------------------------------------------------------------
 // 9. FRONTEND (HTML + Tailwind CDN + JS vanilla) — servido desde GET /
@@ -751,6 +1032,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
   'use strict';
 
   var API_BASE = '/api';
+  var SEMANAS_A_GENERAR_CLIENTE = 4; // debe coincidir con SEMANAS_A_GENERAR del servidor
 
   var estado = {
     token: localStorage.getItem('traveling_token') || null,
@@ -770,7 +1052,9 @@ const PAGINA_HTML = `<!DOCTYPE html>
     misReservas: [],
     misReservasCargando: false,
     modalViajeId: null,
-    enviando: false
+    enviando: false,
+    notificacionesEstado: 'default',
+    clavePublicaVapid: null
   };
 
   try {
@@ -823,6 +1107,22 @@ const PAGINA_HTML = `<!DOCTYPE html>
     return hoy.getFullYear() + '-' + mes + '-' + dia;
   }
 
+  function casillasDias(nombreCampo, colorTailwind) {
+    var codigos = ['LUN', 'MAR', 'MIE', 'JUE', 'VIE', 'SAB', 'DOM'];
+    var etiquetas = { LUN: 'L', MAR: 'M', MIE: 'X', JUE: 'J', VIE: 'V', SAB: 'S', DOM: 'D' };
+    var p = [];
+    p.push('<div class="flex gap-1.5 flex-wrap">');
+    for (var i = 0; i < codigos.length; i++) {
+      var codigo = codigos[i];
+      p.push('<label class="cursor-pointer" title="' + codigo + '">');
+      p.push('  <input type="checkbox" name="' + nombreCampo + '" value="' + codigo + '" class="peer sr-only">');
+      p.push('  <span class="flex items-center justify-center w-9 h-9 rounded-full border border-travel-line text-sm font-semibold text-travel-muted transition peer-checked:bg-' + colorTailwind + ' peer-checked:text-white peer-checked:border-' + colorTailwind + '">' + etiquetas[codigo] + '</span>');
+      p.push('</label>');
+    }
+    p.push('</div>');
+    return p.join('');
+  }
+
   function mostrarToast(mensaje, tipo) {
     var contenedor = document.getElementById('toasts');
     if (!contenedor) return;
@@ -869,6 +1169,93 @@ const PAGINA_HTML = `<!DOCTYPE html>
   }
 
   // ---------------------------------------------------------------------
+  // Sonido y notificaciones push
+  // ---------------------------------------------------------------------
+
+  function reproducirSonidoAviso() {
+    try {
+      var ContextoAudio = window.AudioContext || window.webkitAudioContext;
+      if (!ContextoAudio) return;
+      var contexto = new ContextoAudio();
+      var oscilador = contexto.createOscillator();
+      var ganancia = contexto.createGain();
+      oscilador.type = 'sine';
+      oscilador.frequency.setValueAtTime(880, contexto.currentTime);
+      oscilador.frequency.setValueAtTime(1174, contexto.currentTime + 0.12);
+      ganancia.gain.setValueAtTime(0.15, contexto.currentTime);
+      ganancia.gain.exponentialRampToValueAtTime(0.001, contexto.currentTime + 0.45);
+      oscilador.connect(ganancia);
+      ganancia.connect(contexto.destination);
+      oscilador.start();
+      oscilador.stop(contexto.currentTime + 0.45);
+    } catch (err) {
+      // Sin soporte de audio: no pasa nada, seguimos sin sonido.
+    }
+  }
+
+  function convertirClaveVapid(claveBase64) {
+    var resto = claveBase64.length % 4;
+    var relleno = resto ? new Array(5 - resto).join('=') : '';
+    var base64 = (claveBase64 + relleno).replace(/-/g, '+').replace(/_/g, '/');
+    var cadenaCruda = window.atob(base64);
+    var arreglo = new Uint8Array(cadenaCruda.length);
+    for (var i = 0; i < cadenaCruda.length; i++) {
+      arreglo[i] = cadenaCruda.charCodeAt(i);
+    }
+    return arreglo;
+  }
+
+  function registrarServiceWorker() {
+    if (!('serviceWorker' in navigator)) return Promise.resolve(null);
+    return navigator.serviceWorker.register('/sw.js').catch(function () { return null; });
+  }
+
+  function obtenerClavePublicaVapid() {
+    if (estado.clavePublicaVapid) return Promise.resolve(estado.clavePublicaVapid);
+    return api('/notificaciones/clave-publica', { method: 'GET' }).then(function (datos) {
+      estado.clavePublicaVapid = datos.clavePublica;
+      return datos.clavePublica;
+    });
+  }
+
+  function activarNotificaciones() {
+    if (!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) {
+      mostrarToast('Tu navegador no soporta notificaciones push.', 'error');
+      return Promise.resolve(false);
+    }
+    return Notification.requestPermission().then(function (permiso) {
+      estado.notificacionesEstado = permiso;
+      if (permiso !== 'granted') {
+        mostrarToast('No se activaron las notificaciones.', 'info');
+        render();
+        return false;
+      }
+      return obtenerClavePublicaVapid().then(function (clavePublica) {
+        if (!clavePublica) {
+          mostrarToast('Las notificaciones aún no están configuradas en el servidor.', 'error');
+          return false;
+        }
+        return registrarServiceWorker().then(function (registro) {
+          if (!registro) return false;
+          return registro.pushManager.subscribe({
+            userVisibleOnly: true,
+            applicationServerKey: convertirClaveVapid(clavePublica)
+          }).then(function (suscripcion) {
+            return api('/notificaciones/suscribir', { method: 'POST', cuerpo: suscripcion.toJSON() }).then(function () {
+              mostrarToast('Notificaciones activadas.', 'exito');
+              render();
+              return true;
+            });
+          });
+        });
+      });
+    }).catch(function () {
+      mostrarToast('No pudimos activar las notificaciones.', 'error');
+      return false;
+    });
+  }
+
+  // ---------------------------------------------------------------------
   // Sesión
   // ---------------------------------------------------------------------
 
@@ -893,6 +1280,11 @@ const PAGINA_HTML = `<!DOCTYPE html>
   }
 
   function iniciarApp() {
+    if ('Notification' in window) {
+      estado.notificacionesEstado = Notification.permission;
+    }
+    registrarServiceWorker();
+
     if (estado.token) {
       api('/auth/perfil', { method: 'GET' }).then(function (datos) {
         estado.usuario = datos.usuario;
@@ -939,7 +1331,13 @@ const PAGINA_HTML = `<!DOCTYPE html>
     partes.push('    </div>');
     if (estado.usuario) {
       var inicial = escaparHTML((estado.usuario.nombre || '?').trim().charAt(0).toUpperCase());
-      partes.push('    <div class="flex items-center gap-3">');
+      var notiActivas = estado.notificacionesEstado === 'granted';
+      partes.push('    <div class="flex items-center gap-2 sm:gap-3">');
+      if (!notiActivas) {
+        partes.push('      <button data-action="activar-notificaciones" title="Activar notificaciones" class="w-9 h-9 flex items-center justify-center rounded-full bg-white/10 hover:bg-white/20 transition text-lg">🔔</button>');
+      } else {
+        partes.push('      <span title="Notificaciones activadas" class="w-9 h-9 flex items-center justify-center rounded-full bg-travel-accent/20 text-lg">🔔</span>');
+      }
       partes.push('      <div class="hidden sm:flex flex-col items-end leading-tight">');
       partes.push('        <span class="text-sm font-semibold">' + escaparHTML(estado.usuario.nombre) + '</span>');
       partes.push('        <span class="text-xs text-white/60">' + (estado.usuario.rol === 'conductor' ? 'Conductor' : 'Pasajero') + '</span>');
@@ -1094,15 +1492,19 @@ const PAGINA_HTML = `<!DOCTYPE html>
     p.push('      <input type="text" name="destino" required minlength="2" maxlength="150" placeholder="Ej. Bogotá" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
     p.push('    </div>');
     p.push('  </div>');
-    p.push('  <div class="grid grid-cols-2 gap-3">');
-    p.push('    <div>');
-    p.push('      <label class="block text-sm font-medium text-travel-ink mb-1">Fecha de salida</label>');
-    p.push('      <input type="date" name="fecha_salida" required min="' + fechaMinima() + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
-    p.push('    </div>');
-    p.push('    <div>');
-    p.push('      <label class="block text-sm font-medium text-travel-ink mb-1">Hora de salida</label>');
-    p.push('      <input type="time" name="hora_salida" required class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
-    p.push('    </div>');
+    p.push('  <div>');
+    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">Hora de salida</label>');
+    p.push('    <input type="time" name="hora_salida" required class="w-full sm:w-48 rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('  </div>');
+    p.push('  <div>');
+    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">¿Qué días de la semana circulas?</label>');
+    p.push('    <p class="text-xs text-travel-muted mb-2">Se publicarán las salidas de las próximas ' + SEMANAS_A_GENERAR_CLIENTE + ' semanas en esos días.</p>');
+    p.push(casillasDias('dias_semana', 'travel-primary'));
+    p.push('  </div>');
+    p.push('  <div>');
+    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">¿Tienes pico y placa? <span class="font-normal text-travel-muted">(opcional)</span></label>');
+    p.push('    <p class="text-xs text-travel-muted mb-2">Marca el día que tu vehículo no puede circular. Los pasajeros lo verán marcado como "EN PICO Y PLACA".</p>');
+    p.push(casillasDias('pico_placa_dias', 'travel-danger'));
     p.push('  </div>');
     p.push('  <div class="grid grid-cols-2 gap-3">');
     p.push('    <div>');
@@ -1280,10 +1682,23 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('        <p class="text-xs text-travel-muted">' + escaparHTML(v.vehiculo_modelo) + ' · ' + escaparHTML(v.vehiculo_placa) + '</p>');
       p.push('      </div>');
       p.push('    </div>');
-      p.push('    <div class="text-right">');
-      p.push('      <p class="text-xs text-travel-muted mb-1">' + v.puestos_disponibles + ' puesto(s) libres</p>');
-      p.push('      <button data-action="abrir-modal-reserva" data-id="' + v.id + '" class="bg-travel-accent hover:bg-travel-accentdark transition text-travel-primarydark font-bold rounded-xl px-4 py-2 text-sm">Reservar</button>');
-      p.push('    </div>');
+      if (v.pico_y_placa) {
+        p.push('    <span class="text-xs font-bold px-3 py-2 rounded-full bg-travel-danger/10 text-travel-danger whitespace-nowrap">EN PICO Y PLACA</span>');
+      } else if (v.puestos_disponibles > 0) {
+        p.push('    <div class="text-right">');
+        p.push('      <p class="text-xs text-travel-muted mb-1">' + v.puestos_disponibles + ' puesto(s) libres</p>');
+        p.push('      <button data-action="abrir-modal-reserva" data-id="' + v.id + '" class="bg-travel-accent hover:bg-travel-accentdark transition text-travel-primarydark font-bold rounded-xl px-4 py-2 text-sm">Reservar</button>');
+        p.push('    </div>');
+      } else {
+        p.push('    <div class="text-right">');
+        p.push('      <p class="text-xs text-travel-muted mb-1">Sin cupo por ahora</p>');
+        if (v.tiene_aviso) {
+          p.push('      <button data-action="quitar-aviso-cupo" data-id="' + v.id + '" class="bg-travel-success/10 text-travel-success font-bold rounded-xl px-3 py-2 text-xs whitespace-nowrap">🔔 Te avisaremos</button>');
+        } else {
+          p.push('      <button data-action="avisar-cupo" data-id="' + v.id + '" class="bg-travel-primary/10 text-travel-primary font-bold rounded-xl px-3 py-2 text-xs whitespace-nowrap">🔔 Avisarme si hay cupo</button>');
+        }
+        p.push('    </div>');
+      }
       p.push('  </div>');
       p.push('</div>');
     }
@@ -1456,6 +1871,41 @@ const PAGINA_HTML = `<!DOCTYPE html>
     });
   }
 
+  function marcarAvisoLocal(viajeId, valor) {
+    for (var i = 0; i < estado.viajesBusqueda.length; i++) {
+      if (estado.viajesBusqueda[i].id === Number(viajeId)) {
+        estado.viajesBusqueda[i].tiene_aviso = valor;
+        break;
+      }
+    }
+    render();
+  }
+
+  function pedirAvisoCupo(viajeId) {
+    var registrarAviso = function () {
+      api('/viajes/' + viajeId + '/avisar-cupo', { method: 'POST' }).then(function (datos) {
+        mostrarToast(datos.mensaje, 'exito');
+        marcarAvisoLocal(viajeId, true);
+      }).catch(function (err) {
+        mostrarToast(err.message, 'error');
+      });
+    };
+    if (estado.notificacionesEstado === 'granted') {
+      registrarAviso();
+    } else {
+      activarNotificaciones().then(function () { registrarAviso(); });
+    }
+  }
+
+  function quitarAvisoCupo(viajeId) {
+    api('/viajes/' + viajeId + '/avisar-cupo', { method: 'DELETE' }).then(function (datos) {
+      mostrarToast(datos.mensaje, 'exito');
+      marcarAvisoLocal(viajeId, false);
+    }).catch(function (err) {
+      mostrarToast(err.message, 'error');
+    });
+  }
+
   // ---------------------------------------------------------------------
   // Manejadores de formularios
   // ---------------------------------------------------------------------
@@ -1463,7 +1913,19 @@ const PAGINA_HTML = `<!DOCTYPE html>
   function datosFormulario(formulario) {
     var datos = {};
     var elementos = new FormData(formulario);
-    elementos.forEach(function (valor, clave) { datos[clave] = valor; });
+    elementos.forEach(function (valor, clave) {
+      if (Object.prototype.hasOwnProperty.call(datos, clave)) {
+        // Ya había un valor con esa clave (checkboxes repetidos): lo
+        // convertimos en arreglo en vez de perder el anterior.
+        if (Array.isArray(datos[clave])) {
+          datos[clave].push(valor);
+        } else {
+          datos[clave] = [datos[clave], valor];
+        }
+      } else {
+        datos[clave] = valor;
+      }
+    });
     return datos;
   }
 
@@ -1574,6 +2036,9 @@ const PAGINA_HTML = `<!DOCTYPE html>
     else if (accion === 'abrir-modal-reserva') { abrirModalReserva(id); }
     else if (accion === 'cerrar-modal') { estado.modalViajeId = null; render(); }
     else if (accion === 'cancelar-reserva') { confirmarCancelarReserva(id); }
+    else if (accion === 'activar-notificaciones') { activarNotificaciones(); }
+    else if (accion === 'avisar-cupo') { pedirAvisoCupo(id); }
+    else if (accion === 'quitar-aviso-cupo') { quitarAvisoCupo(id); }
   });
 
   document.addEventListener('change', function (e) {
@@ -1611,6 +2076,25 @@ const PAGINA_HTML = `<!DOCTYPE html>
     if (estado.vista === 'pasajero' && estado.pasajeroTab === 'mis-reservas') cargarMisReservas(false);
   }, 20000);
 
+  // Cuando llega una notificación push mientras la pestaña está abierta, el
+  // Service Worker nos la reenvía aquí para poder sonar y mostrar un toast
+  // aunque el navegador no muestre la notificación del sistema en primer plano.
+  if ('serviceWorker' in navigator) {
+    navigator.serviceWorker.addEventListener('message', function (event) {
+      if (event.data && event.data.tipo === 'notificacion-push') {
+        reproducirSonidoAviso();
+        var carga = event.data.payload || {};
+        mostrarToast(carga.cuerpo || carga.titulo || 'Tienes una novedad en Traveling.', 'info');
+        if (estado.usuario && estado.usuario.rol === 'conductor' && estado.conductorTab === 'mis-viajes') {
+          cargarMisViajes(false);
+        }
+        if (estado.usuario && estado.usuario.rol === 'pasajero' && estado.pasajeroTab === 'buscar') {
+          cargarBusqueda();
+        }
+      }
+    });
+  }
+
   document.addEventListener('DOMContentLoaded', iniciarApp);
 })();
 </script>
@@ -1619,6 +2103,10 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
 app.get('/', (req, res) => {
   res.type('html').send(PAGINA_HTML);
+});
+
+app.get('/sw.js', (req, res) => {
+  res.type('application/javascript').send(SERVICE_WORKER_JS);
 });
 
 // -----------------------------------------------------------------------------
