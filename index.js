@@ -273,24 +273,29 @@ const REGEX_HORA = /^\d{2}:\d{2}(:\d{2})?$/;
 
 // Días de la semana: el índice coincide con Date.getDay() (0 = domingo).
 const DIAS_SEMANA = ['DOM', 'LUN', 'MAR', 'MIE', 'JUE', 'VIE', 'SAB'];
-const SEMANAS_A_GENERAR = 4; // cuántas semanas hacia adelante se publican de una vez
 
 function diaValido(codigo) {
   return DIAS_SEMANA.indexOf(codigo) !== -1;
 }
 
 /**
- * Dada una lista de códigos de día (['LUN','MIE']) devuelve, para las
- * próximas SEMANAS_A_GENERAR semanas empezando mañana, las fechas
- * (YYYY-MM-DD) cuyo día de la semana coincide.
+ * Dada una lista de códigos de día (['LUN','MIE']) devuelve las fechas
+ * (YYYY-MM-DD) de la semana actual (domingo a sábado) que coinciden y que
+ * todavía no han pasado (desde mañana en adelante). Cada semana el
+ * conductor vuelve a publicar para la semana siguiente.
  */
 function generarFechasParaDias(codigosDias) {
   const fechas = [];
-  const hoy = new Date();
-  hoy.setHours(0, 0, 0, 0);
-  const totalDias = SEMANAS_A_GENERAR * 7;
-  for (let i = 1; i <= totalDias; i++) {
-    const fecha = new Date(hoy.getTime() + i * 24 * 60 * 60 * 1000);
+  const manana = new Date();
+  manana.setHours(0, 0, 0, 0);
+  manana.setDate(manana.getDate() + 1);
+
+  // Domingo de la semana de "mañana" (0 = domingo, así que restamos su
+  // propio índice para llegar al domingo de esa misma semana).
+  const inicioSemana = new Date(manana.getTime() - manana.getDay() * 24 * 60 * 60 * 1000);
+  const finSemana = new Date(inicioSemana.getTime() + 6 * 24 * 60 * 60 * 1000); // sábado
+
+  for (let fecha = new Date(manana); fecha <= finSemana; fecha.setDate(fecha.getDate() + 1)) {
     const codigoDia = DIAS_SEMANA[fecha.getDay()];
     if (codigosDias.indexOf(codigoDia) !== -1) {
       const anio = fecha.getFullYear();
@@ -382,9 +387,14 @@ async function enviarNotificacionAUsuario(usuarioId, payload) {
       const suscripcion = { endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } };
       try {
         await webpush.sendNotification(suscripcion, JSON.stringify(payload));
+        console.log(`[Traveling] Push enviado a usuario ${usuarioId} (suscripción ${s.id}).`);
       } catch (err) {
-        if (err && (err.statusCode === 404 || err.statusCode === 410)) {
+        const codigo = err && err.statusCode;
+        if (codigo === 404 || codigo === 410 || codigo === 401 || codigo === 403) {
+          // Suscripción vencida o firmada con otras claves VAPID: se borra
+          // para que el usuario tenga que volver a activarla desde la app.
           await pool.query('DELETE FROM push_suscripciones WHERE id = ?', [s.id]);
+          console.warn(`[Traveling] Suscripción push ${s.id} inválida (HTTP ${codigo}), eliminada.`);
         } else {
           console.error('[Traveling] Error enviando notificación push:', err && err.message);
         }
@@ -576,7 +586,10 @@ app.post('/api/viajes', autenticar, requiereRol('conductor'), manejadorAsincrono
   const fechasPicoPlaca = diasPicoPlaca.length ? generarFechasParaDias(diasPicoPlaca) : [];
 
   if (fechasCirculacion.length === 0) {
-    return res.status(400).json({ ok: false, mensaje: 'No se pudo generar ninguna fecha con esos días. Intenta de nuevo.' });
+    return res.status(400).json({
+      ok: false,
+      mensaje: 'Esos días ya pasaron en la semana actual (domingo a sábado). Vuelve a publicar el próximo domingo.',
+    });
   }
 
   const filasAInsertar = [];
@@ -594,7 +607,7 @@ app.post('/api/viajes', autenticar, requiereRol('conductor'), manejadorAsincrono
 
   res.status(201).json({
     ok: true,
-    mensaje: `Viaje publicado: se generaron ${fechasCirculacion.length} salida(s) en las próximas ${SEMANAS_A_GENERAR} semanas.`,
+    mensaje: `Viaje publicado: se generaron ${fechasCirculacion.length} salida(s) para esta semana (domingo a sábado).`,
     totalGenerado: fechasCirculacion.length,
   });
 }));
@@ -847,6 +860,70 @@ app.patch('/api/reservas/:id/cancelar', autenticar, requiereRol('pasajero'), man
   }
 }));
 
+app.patch('/api/reservas/:id/cancelar-conductor', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!enteroPositivo(id)) return res.status(400).json({ ok: false, mensaje: 'Reserva inválida.' });
+
+  const conexion = await pool.getConnection();
+  try {
+    await conexion.beginTransaction();
+
+    const [filasReserva] = await conexion.query('SELECT * FROM reservas WHERE id = ? FOR UPDATE', [id]);
+    const reserva = filasReserva[0];
+    if (!reserva) {
+      await conexion.rollback();
+      return res.status(404).json({ ok: false, mensaje: 'Esa reserva no existe.' });
+    }
+
+    const [filasViaje] = await conexion.query('SELECT * FROM viajes WHERE id = ? FOR UPDATE', [reserva.viaje_id]);
+    const viaje = filasViaje[0];
+    if (!viaje || viaje.conductor_id !== req.usuario.id) {
+      await conexion.rollback();
+      return res.status(403).json({ ok: false, mensaje: 'Esa reserva no pertenece a uno de tus viajes.' });
+    }
+    if (reserva.estado !== 'confirmada') {
+      await conexion.rollback();
+      return res.status(400).json({ ok: false, mensaje: 'Esa reserva ya estaba cancelada.' });
+    }
+
+    await conexion.query("UPDATE reservas SET estado = 'cancelada' WHERE id = ?", [id]);
+
+    let seLiberoCupo = false;
+    if (viaje.estado === 'activo') {
+      const restaurados = Math.min(viaje.puestos_totales, viaje.puestos_disponibles + reserva.puestos_reservados);
+      await conexion.query('UPDATE viajes SET puestos_disponibles = ? WHERE id = ?', [restaurados, viaje.id]);
+      seLiberoCupo = restaurados > 0;
+    }
+
+    await conexion.commit();
+    res.json({ ok: true, mensaje: 'Reserva del pasajero cancelada correctamente.' });
+
+    // Avisa al pasajero de que el conductor canceló su reserva.
+    enviarNotificacionAUsuario(reserva.pasajero_id, {
+      titulo: 'Tu reserva fue cancelada',
+      cuerpo: `El conductor canceló tu reserva en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
+      url: '/',
+    });
+
+    // Avisa a quienes pidieron que les avisaran de cupo en este viaje.
+    if (seLiberoCupo) {
+      const [interesados] = await pool.query('SELECT pasajero_id FROM avisos_cupo WHERE viaje_id = ?', [viaje.id]);
+      for (const interesado of interesados) {
+        enviarNotificacionAUsuario(interesado.pasajero_id, {
+          titulo: '¡Hay cupo disponible!',
+          cuerpo: `Se liberó un puesto en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
+          url: '/',
+        });
+      }
+    }
+  } catch (err) {
+    await conexion.rollback();
+    throw err;
+  } finally {
+    conexion.release();
+  }
+}));
+
 // -----------------------------------------------------------------------------
 // 8.5 RUTAS API — NOTIFICACIONES PUSH
 // -----------------------------------------------------------------------------
@@ -1032,7 +1109,6 @@ const PAGINA_HTML = `<!DOCTYPE html>
   'use strict';
 
   var API_BASE = '/api';
-  var SEMANAS_A_GENERAR_CLIENTE = 4; // debe coincidir con SEMANAS_A_GENERAR del servidor
 
   var estado = {
     token: localStorage.getItem('traveling_token') || null,
@@ -1207,7 +1283,14 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
   function registrarServiceWorker() {
     if (!('serviceWorker' in navigator)) return Promise.resolve(null);
-    return navigator.serviceWorker.register('/sw.js').catch(function () { return null; });
+    return navigator.serviceWorker.register('/sw.js').then(function (registro) {
+      // Espera a que quede realmente activo antes de usarlo, si no,
+      // pushManager.subscribe puede fallar en el primer intento.
+      return navigator.serviceWorker.ready.then(function () { return registro; });
+    }).catch(function (err) {
+      console.error('[Traveling] No se pudo registrar el Service Worker:', err);
+      return null;
+    });
   }
 
   function obtenerClavePublicaVapid() {
@@ -1220,36 +1303,57 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
   function activarNotificaciones() {
     if (!('Notification' in window) || !('serviceWorker' in navigator) || !('PushManager' in window)) {
-      mostrarToast('Tu navegador no soporta notificaciones push.', 'error');
+      mostrarToast('Este navegador no soporta notificaciones push.', 'error');
       return Promise.resolve(false);
     }
+
+    if (Notification.permission === 'denied') {
+      mostrarToast('Tienes las notificaciones bloqueadas para este sitio. Actívalas desde el candado/ajustes del navegador junto a la dirección web.', 'error');
+      return Promise.resolve(false);
+    }
+
     return Notification.requestPermission().then(function (permiso) {
       estado.notificacionesEstado = permiso;
+      render();
       if (permiso !== 'granted') {
-        mostrarToast('No se activaron las notificaciones.', 'info');
-        render();
+        mostrarToast('No se activaron las notificaciones: el permiso quedó en "' + permiso + '".', 'info');
         return false;
       }
+
       return obtenerClavePublicaVapid().then(function (clavePublica) {
         if (!clavePublica) {
-          mostrarToast('Las notificaciones aún no están configuradas en el servidor.', 'error');
+          mostrarToast('Las notificaciones aún no están configuradas en el servidor (faltan las claves VAPID).', 'error');
           return false;
         }
+
         return registrarServiceWorker().then(function (registro) {
-          if (!registro) return false;
-          return registro.pushManager.subscribe({
-            userVisibleOnly: true,
-            applicationServerKey: convertirClaveVapid(clavePublica)
+          if (!registro) {
+            mostrarToast('No se pudo preparar el Service Worker en este navegador.', 'error');
+            return false;
+          }
+
+          return registro.pushManager.getSubscription().then(function (existente) {
+            if (existente) return existente;
+            return registro.pushManager.subscribe({
+              userVisibleOnly: true,
+              applicationServerKey: convertirClaveVapid(clavePublica)
+            });
           }).then(function (suscripcion) {
             return api('/notificaciones/suscribir', { method: 'POST', cuerpo: suscripcion.toJSON() }).then(function () {
-              mostrarToast('Notificaciones activadas.', 'exito');
+              mostrarToast('Notificaciones activadas. Así vas a sonar.', 'exito');
+              reproducirSonidoAviso();
               render();
               return true;
             });
+          }).catch(function (err) {
+            console.error('[Traveling] Error creando la suscripción push:', err);
+            mostrarToast('No se pudo activar el push: ' + (err && err.message ? err.message : 'error desconocido') + '.', 'error');
+            return false;
           });
         });
       });
-    }).catch(function () {
+    }).catch(function (err) {
+      console.error('[Traveling] Error activando notificaciones:', err);
       mostrarToast('No pudimos activar las notificaciones.', 'error');
       return false;
     });
@@ -1498,7 +1602,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
     p.push('  </div>');
     p.push('  <div>');
     p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">¿Qué días de la semana circulas?</label>');
-    p.push('    <p class="text-xs text-travel-muted mb-2">Se publicarán las salidas de las próximas ' + SEMANAS_A_GENERAR_CLIENTE + ' semanas en esos días.</p>');
+    p.push('    <p class="text-xs text-travel-muted mb-2">Se publican las salidas de esta semana (domingo a sábado) en esos días. La próxima semana debes volver a publicar.</p>');
     p.push(casillasDias('dias_semana', 'travel-primary'));
     p.push('  </div>');
     p.push('  <div>');
@@ -1598,7 +1702,10 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('    <p class="text-sm font-semibold text-travel-ink">' + escaparHTML(r.pasajero_nombre) + ' · ' + r.puestos_reservados + ' puesto(s)</p>');
       p.push('    <p class="text-xs text-travel-muted mt-0.5">Recogida: ' + escaparHTML(r.punto_recogida) + '</p>');
       p.push('  </div>');
-      p.push('  <a href="tel:' + escaparHTML(r.pasajero_telefono) + '" class="text-xs font-semibold text-travel-primary whitespace-nowrap">' + escaparHTML(r.pasajero_telefono) + '</a>');
+      p.push('  <div class="text-right shrink-0 flex flex-col items-end gap-1.5">');
+      p.push('    <a href="tel:' + escaparHTML(r.pasajero_telefono) + '" class="text-xs font-semibold text-travel-primary whitespace-nowrap">' + escaparHTML(r.pasajero_telefono) + '</a>');
+      p.push('    <button data-action="cancelar-reserva-conductor" data-id="' + r.id + '" class="text-xs font-semibold text-travel-danger bg-travel-danger/5 hover:bg-travel-danger/10 transition rounded-lg px-2 py-1 whitespace-nowrap">Cancelar</button>');
+      p.push('  </div>');
       p.push('</div>');
     }
     p.push('</div>');
@@ -1871,6 +1978,34 @@ const PAGINA_HTML = `<!DOCTYPE html>
     });
   }
 
+  function encontrarViajeDeReserva(reservaId) {
+    for (var viajeId in estado.detallePasajeros) {
+      if (!Object.prototype.hasOwnProperty.call(estado.detallePasajeros, viajeId)) continue;
+      var lista = estado.detallePasajeros[viajeId] || [];
+      for (var i = 0; i < lista.length; i++) {
+        if (lista[i].id === Number(reservaId)) return viajeId;
+      }
+    }
+    return null;
+  }
+
+  function confirmarCancelarReservaConductor(reservaId) {
+    if (!window.confirm('¿Seguro que deseas cancelar la reserva de este pasajero? Se le notificará.')) return;
+    var viajeIdAfectado = encontrarViajeDeReserva(reservaId);
+    api('/reservas/' + reservaId + '/cancelar-conductor', { method: 'PATCH' }).then(function (datos) {
+      mostrarToast(datos.mensaje, 'exito');
+      if (viajeIdAfectado) {
+        api('/viajes/' + viajeIdAfectado + '/reservas', { method: 'GET' }).then(function (datosDetalle) {
+          estado.detallePasajeros[viajeIdAfectado] = datosDetalle.reservas;
+          render();
+        });
+      }
+      cargarMisViajes(false);
+    }).catch(function (err) {
+      mostrarToast(err.message, 'error');
+    });
+  }
+
   function marcarAvisoLocal(viajeId, valor) {
     for (var i = 0; i < estado.viajesBusqueda.length; i++) {
       if (estado.viajesBusqueda[i].id === Number(viajeId)) {
@@ -2036,6 +2171,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
     else if (accion === 'abrir-modal-reserva') { abrirModalReserva(id); }
     else if (accion === 'cerrar-modal') { estado.modalViajeId = null; render(); }
     else if (accion === 'cancelar-reserva') { confirmarCancelarReserva(id); }
+    else if (accion === 'cancelar-reserva-conductor') { confirmarCancelarReservaConductor(id); }
     else if (accion === 'activar-notificaciones') { activarNotificaciones(); }
     else if (accion === 'avisar-cupo') { pedirAvisoCupo(id); }
     else if (accion === 'quitar-aviso-cupo') { quitarAvisoCupo(id); }
