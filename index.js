@@ -321,6 +321,27 @@ function numeroNoNegativo(valor) {
   return Number.isFinite(n) && n >= 0;
 }
 
+/**
+ * Decide cuántos puestos de una reserva se van a cancelar. Si no viene
+ * "puestos_a_cancelar" en el cuerpo, se cancela la reserva completa (para
+ * no romper llamadas viejas). Si viene, se valida contra lo que de verdad
+ * tiene reservado.
+ */
+function resolverPuestosACancelar(cuerpoPeticion, reserva) {
+  const crudo = cuerpoPeticion.puestos_a_cancelar;
+  if (crudo === undefined || crudo === null || crudo === '') {
+    return { cantidad: reserva.puestos_reservados };
+  }
+  const cantidad = Number(crudo);
+  if (!enteroPositivo(cantidad)) {
+    return { error: 'Indica una cantidad válida de puestos a cancelar.' };
+  }
+  if (cantidad > reserva.puestos_reservados) {
+    return { error: `Esa reserva solo tiene ${reserva.puestos_reservados} puesto(s) para cancelar.` };
+  }
+  return { cantidad };
+}
+
 // -----------------------------------------------------------------------------
 // 5. APLICACIÓN EXPRESS
 // -----------------------------------------------------------------------------
@@ -827,19 +848,34 @@ app.patch('/api/reservas/:id/cancelar', autenticar, requiereRol('pasajero'), man
       return res.status(400).json({ ok: false, mensaje: 'Esa reserva ya estaba cancelada.' });
     }
 
-    await conexion.query("UPDATE reservas SET estado = 'cancelada' WHERE id = ?", [id]);
+    const resuelto = resolverPuestosACancelar(req.body || {}, reserva);
+    if (resuelto.error) {
+      await conexion.rollback();
+      return res.status(400).json({ ok: false, mensaje: resuelto.error });
+    }
+    const puestosACancelar = resuelto.cantidad;
+    const puestosRestantes = reserva.puestos_reservados - puestosACancelar;
+
+    if (puestosRestantes > 0) {
+      await conexion.query('UPDATE reservas SET puestos_reservados = ? WHERE id = ?', [puestosRestantes, id]);
+    } else {
+      await conexion.query("UPDATE reservas SET estado = 'cancelada' WHERE id = ?", [id]);
+    }
 
     const [filasViaje] = await conexion.query('SELECT * FROM viajes WHERE id = ? FOR UPDATE', [reserva.viaje_id]);
     const viaje = filasViaje[0];
     let seLiberoCupo = false;
     if (viaje && viaje.estado === 'activo') {
-      const restaurados = Math.min(viaje.puestos_totales, viaje.puestos_disponibles + reserva.puestos_reservados);
+      const restaurados = Math.min(viaje.puestos_totales, viaje.puestos_disponibles + puestosACancelar);
       await conexion.query('UPDATE viajes SET puestos_disponibles = ? WHERE id = ?', [restaurados, viaje.id]);
       seLiberoCupo = restaurados > 0;
     }
 
     await conexion.commit();
-    res.json({ ok: true, mensaje: 'Reserva cancelada correctamente.' });
+    const mensajeExito = puestosRestantes > 0
+      ? `Cancelaste ${puestosACancelar} puesto(s). Te quedan ${puestosRestantes} puesto(s) confirmado(s) en ese viaje.`
+      : 'Reserva cancelada correctamente.';
+    res.json({ ok: true, mensaje: mensajeExito });
 
     // Avisa a quienes pidieron que les avisaran de cupo en este viaje.
     if (seLiberoCupo) {
@@ -886,22 +922,39 @@ app.patch('/api/reservas/:id/cancelar-conductor', autenticar, requiereRol('condu
       return res.status(400).json({ ok: false, mensaje: 'Esa reserva ya estaba cancelada.' });
     }
 
-    await conexion.query("UPDATE reservas SET estado = 'cancelada' WHERE id = ?", [id]);
+    const resuelto = resolverPuestosACancelar(req.body || {}, reserva);
+    if (resuelto.error) {
+      await conexion.rollback();
+      return res.status(400).json({ ok: false, mensaje: resuelto.error });
+    }
+    const puestosACancelar = resuelto.cantidad;
+    const puestosRestantes = reserva.puestos_reservados - puestosACancelar;
+
+    if (puestosRestantes > 0) {
+      await conexion.query('UPDATE reservas SET puestos_reservados = ? WHERE id = ?', [puestosRestantes, id]);
+    } else {
+      await conexion.query("UPDATE reservas SET estado = 'cancelada' WHERE id = ?", [id]);
+    }
 
     let seLiberoCupo = false;
     if (viaje.estado === 'activo') {
-      const restaurados = Math.min(viaje.puestos_totales, viaje.puestos_disponibles + reserva.puestos_reservados);
+      const restaurados = Math.min(viaje.puestos_totales, viaje.puestos_disponibles + puestosACancelar);
       await conexion.query('UPDATE viajes SET puestos_disponibles = ? WHERE id = ?', [restaurados, viaje.id]);
       seLiberoCupo = restaurados > 0;
     }
 
     await conexion.commit();
-    res.json({ ok: true, mensaje: 'Reserva del pasajero cancelada correctamente.' });
+    const mensajeExito = puestosRestantes > 0
+      ? `Cancelaste ${puestosACancelar} de los ${reserva.puestos_reservados} puesto(s) de ese pasajero.`
+      : 'Reserva del pasajero cancelada correctamente.';
+    res.json({ ok: true, mensaje: mensajeExito });
 
-    // Avisa al pasajero de que el conductor canceló su reserva.
+    // Avisa al pasajero de que el conductor canceló (parte de) su reserva.
     enviarNotificacionAUsuario(reserva.pasajero_id, {
-      titulo: 'Tu reserva fue cancelada',
-      cuerpo: `El conductor canceló tu reserva en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
+      titulo: puestosRestantes > 0 ? 'Se canceló parte de tu reserva' : 'Tu reserva fue cancelada',
+      cuerpo: puestosRestantes > 0
+        ? `El conductor canceló ${puestosACancelar} puesto(s) de tu reserva en ${viaje.origen} → ${viaje.destino}. Te quedan ${puestosRestantes}.`
+        : `El conductor canceló tu reserva en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
       url: '/',
     });
 
@@ -1704,7 +1757,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('  </div>');
       p.push('  <div class="text-right shrink-0 flex flex-col items-end gap-1.5">');
       p.push('    <a href="tel:' + escaparHTML(r.pasajero_telefono) + '" class="text-xs font-semibold text-travel-primary whitespace-nowrap">' + escaparHTML(r.pasajero_telefono) + '</a>');
-      p.push('    <button data-action="cancelar-reserva-conductor" data-id="' + r.id + '" class="text-xs font-semibold text-travel-danger bg-travel-danger/5 hover:bg-travel-danger/10 transition rounded-lg px-2 py-1 whitespace-nowrap">Cancelar</button>');
+      p.push('    <button data-action="cancelar-reserva-conductor" data-id="' + r.id + '" data-total="' + r.puestos_reservados + '" class="text-xs font-semibold text-travel-danger bg-travel-danger/5 hover:bg-travel-danger/10 transition rounded-lg px-2 py-1 whitespace-nowrap">Cancelar</button>');
       p.push('  </div>');
       p.push('</div>');
     }
@@ -1876,7 +1929,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('  </div>');
       if (r.estado === 'confirmada' && r.viaje_estado === 'activo') {
         p.push('  <div class="mt-3 pt-3 border-t border-travel-line">');
-        p.push('    <button data-action="cancelar-reserva" data-id="' + r.id + '" class="text-xs font-semibold text-travel-danger bg-travel-danger/5 hover:bg-travel-danger/10 transition rounded-lg px-3 py-2">Cancelar reserva</button>');
+        p.push('    <button data-action="cancelar-reserva" data-id="' + r.id + '" data-total="' + r.puestos_reservados + '" class="text-xs font-semibold text-travel-danger bg-travel-danger/5 hover:bg-travel-danger/10 transition rounded-lg px-3 py-2">Cancelar reserva</button>');
         p.push('  </div>');
       }
       p.push('</div>');
@@ -1968,9 +2021,23 @@ const PAGINA_HTML = `<!DOCTYPE html>
     });
   }
 
-  function confirmarCancelarReserva(reservaId) {
-    if (!window.confirm('¿Seguro que deseas cancelar esta reserva?')) return;
-    api('/reservas/' + reservaId + '/cancelar', { method: 'PATCH' }).then(function (datos) {
+  function pedirCantidadACancelar(totalPuestos) {
+    if (totalPuestos <= 1) return totalPuestos;
+    var texto = window.prompt('¿Cuántos puestos deseas cancelar? (tienes ' + totalPuestos + ')', String(totalPuestos));
+    if (texto === null) return null;
+    var cantidad = parseInt(texto, 10);
+    if (!cantidad || cantidad < 1 || cantidad > totalPuestos) {
+      mostrarToast('Ingresa un número entre 1 y ' + totalPuestos + '.', 'error');
+      return null;
+    }
+    return cantidad;
+  }
+
+  function confirmarCancelarReserva(reservaId, totalPuestos) {
+    var cantidad = pedirCantidadACancelar(totalPuestos);
+    if (cantidad === null) return;
+    if (!window.confirm('¿Cancelar ' + cantidad + ' de ' + totalPuestos + ' puesto(s) de esta reserva?')) return;
+    api('/reservas/' + reservaId + '/cancelar', { method: 'PATCH', cuerpo: { puestos_a_cancelar: cantidad } }).then(function (datos) {
       mostrarToast(datos.mensaje, 'exito');
       cargarMisReservas(false);
     }).catch(function (err) {
@@ -1989,10 +2056,12 @@ const PAGINA_HTML = `<!DOCTYPE html>
     return null;
   }
 
-  function confirmarCancelarReservaConductor(reservaId) {
-    if (!window.confirm('¿Seguro que deseas cancelar la reserva de este pasajero? Se le notificará.')) return;
+  function confirmarCancelarReservaConductor(reservaId, totalPuestos) {
+    var cantidad = pedirCantidadACancelar(totalPuestos);
+    if (cantidad === null) return;
+    if (!window.confirm('¿Cancelar ' + cantidad + ' de ' + totalPuestos + ' puesto(s) de este pasajero? Se le notificará.')) return;
     var viajeIdAfectado = encontrarViajeDeReserva(reservaId);
-    api('/reservas/' + reservaId + '/cancelar-conductor', { method: 'PATCH' }).then(function (datos) {
+    api('/reservas/' + reservaId + '/cancelar-conductor', { method: 'PATCH', cuerpo: { puestos_a_cancelar: cantidad } }).then(function (datos) {
       mostrarToast(datos.mensaje, 'exito');
       if (viajeIdAfectado) {
         api('/viajes/' + viajeIdAfectado + '/reservas', { method: 'GET' }).then(function (datosDetalle) {
@@ -2170,8 +2239,8 @@ const PAGINA_HTML = `<!DOCTYPE html>
     else if (accion === 'cancelar-viaje') { confirmarCancelarViaje(id); }
     else if (accion === 'abrir-modal-reserva') { abrirModalReserva(id); }
     else if (accion === 'cerrar-modal') { estado.modalViajeId = null; render(); }
-    else if (accion === 'cancelar-reserva') { confirmarCancelarReserva(id); }
-    else if (accion === 'cancelar-reserva-conductor') { confirmarCancelarReservaConductor(id); }
+    else if (accion === 'cancelar-reserva') { confirmarCancelarReserva(id, Number(el.getAttribute('data-total')) || 1); }
+    else if (accion === 'cancelar-reserva-conductor') { confirmarCancelarReservaConductor(id, Number(el.getAttribute('data-total')) || 1); }
     else if (accion === 'activar-notificaciones') { activarNotificaciones(); }
     else if (accion === 'avisar-cupo') { pedirAvisoCupo(id); }
     else if (accion === 'quitar-aviso-cupo') { quitarAvisoCupo(id); }
