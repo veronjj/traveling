@@ -2744,14 +2744,33 @@ const PAGINA_HTML = `<!DOCTYPE html>
     var id = Number(viajeId);
     var yaExpandido = !!estado.viajeExpandido[id];
     estado.viajeExpandido[id] = !yaExpandido;
+    if (!yaExpandido) {
+      // Cada vez que se abre, se pide de nuevo al servidor: así nunca se
+      // queda mostrando una lista vieja si llegaron reservas nuevas
+      // después de la última vez que se abrió.
+      delete estado.detallePasajeros[id];
+    }
     render();
-    if (!yaExpandido && !estado.detallePasajeros[id]) {
+    if (!yaExpandido) {
       api('/viajes/' + id + '/reservas', { method: 'GET' }).then(function (datos) {
         estado.detallePasajeros[id] = datos.reservas;
         render();
       }).catch(function (err) {
         mostrarToast(err.message, 'error');
       });
+    }
+  }
+
+  function refrescarDetallePasajerosAbiertos() {
+    for (var idTexto in estado.viajeExpandido) {
+      if (!Object.prototype.hasOwnProperty.call(estado.viajeExpandido, idTexto)) continue;
+      if (!estado.viajeExpandido[idTexto]) continue;
+      (function (id) {
+        api('/viajes/' + id + '/reservas', { method: 'GET' }).then(function (datos) {
+          estado.detallePasajeros[id] = datos.reservas;
+          render();
+        }).catch(function () {});
+      })(idTexto);
     }
   }
 
@@ -3116,7 +3135,10 @@ const PAGINA_HTML = `<!DOCTYPE html>
   // 20s: refresco silencioso de las vistas con datos que cambian con el uso de otros
   setInterval(function () {
     if (!estado.usuario || document.hidden) return;
-    if (estado.vista === 'conductor' && estado.conductorTab === 'mis-viajes') cargarMisViajes(false);
+    if (estado.vista === 'conductor' && estado.conductorTab === 'mis-viajes') {
+      cargarMisViajes(false);
+      refrescarDetallePasajerosAbiertos();
+    }
     if (estado.vista === 'pasajero' && estado.pasajeroTab === 'mis-reservas') cargarMisReservas(false);
   }, 20000);
 
@@ -3131,6 +3153,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
         mostrarToast(carga.cuerpo || carga.titulo || 'Tienes una novedad en Traveling.', 'info');
         if (estado.usuario && estado.usuario.rol === 'conductor' && estado.conductorTab === 'mis-viajes') {
           cargarMisViajes(false);
+          refrescarDetallePasajerosAbiertos();
         }
         if (estado.usuario && estado.usuario.rol === 'pasajero' && estado.pasajeroTab === 'buscar') {
           cargarBusqueda();
