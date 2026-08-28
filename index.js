@@ -840,6 +840,29 @@ app.put('/api/viajes/:id', autenticar, requiereRol('conductor'), manejadorAsincr
   }
 }));
 
+app.patch('/api/viajes/:id/finalizar', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!enteroPositivo(id)) return res.status(400).json({ ok: false, mensaje: 'Viaje inválido.' });
+
+  const [filasViaje] = await pool.query('SELECT * FROM viajes WHERE id = ? LIMIT 1', [id]);
+  const viaje = filasViaje[0];
+  if (!viaje) return res.status(404).json({ ok: false, mensaje: 'Ese viaje no existe.' });
+  if (viaje.conductor_id !== req.usuario.id) {
+    return res.status(403).json({ ok: false, mensaje: 'No puedes finalizar un viaje que no publicaste.' });
+  }
+  if (viaje.estado !== 'activo') {
+    return res.status(400).json({ ok: false, mensaje: 'Ese viaje ya no está activo.' });
+  }
+  const hoy = new Date().toISOString().slice(0, 10);
+  if (viaje.fecha_salida > hoy) {
+    return res.status(400).json({ ok: false, mensaje: 'Todavía no puedes finalizar un viaje que no ha empezado.' });
+  }
+
+  await pool.query("UPDATE viajes SET estado = 'completado' WHERE id = ?", [id]);
+
+  res.json({ ok: true, mensaje: 'Viaje finalizado. Ya quedó libre en tu historial y puedes publicar uno nuevo cuando quieras.' });
+}));
+
 app.get('/api/viajes/:id/reservas', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
   const id = Number(req.params.id);
   if (!enteroPositivo(id)) return res.status(400).json({ ok: false, mensaje: 'Viaje inválido.' });
@@ -1254,7 +1277,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
 <meta name="description" content="Traveling conecta conductores y pasajeros para viajes interurbanos compartidos.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
 <script src="https://cdn.tailwindcss.com"></script>
 <script>
   tailwind.config = {
@@ -1262,17 +1285,17 @@ const PAGINA_HTML = `<!DOCTYPE html>
       extend: {
         colors: {
           travel: {
-            bg: '#F5F6F8',
+            bg: '#F6F5F2',
             surface: '#FFFFFF',
-            ink: '#12203D',
-            primary: '#16305A',
-            primarydark: '#0E2142',
-            accent: '#FFB238',
-            accentdark: '#E0921A',
-            success: '#1E8E5A',
-            danger: '#D64545',
-            muted: '#64748B',
-            line: '#E4E7EC'
+            ink: '#10192B',
+            primary: '#152238',
+            primarydark: '#0A1220',
+            accent: '#C9A24B',
+            accentdark: '#A9822E',
+            success: '#1F8A5F',
+            danger: '#B93B2E',
+            muted: '#6B7280',
+            line: '#E7E4DC'
           }
         },
         fontFamily: {
@@ -1280,28 +1303,29 @@ const PAGINA_HTML = `<!DOCTYPE html>
           body: ['Inter', 'sans-serif']
         },
         boxShadow: {
-          card: '0 1px 2px rgba(18,32,61,0.06), 0 8px 24px -12px rgba(18,32,61,0.15)'
+          card: '0 2px 6px rgba(16,25,43,0.05), 0 20px 48px -24px rgba(16,25,43,0.35)',
+          lift: '0 12px 28px -12px rgba(16,25,43,0.4)'
         }
       }
     }
   };
 </script>
 <style>
-  body { background-color: #F5F6F8; font-family: 'Inter', sans-serif; color: #12203D; }
-  .fuente-display { font-family: 'Space Grotesk', sans-serif; }
-  ::selection { background-color: #FFB238; color: #12203D; }
+  body { background-color: #F6F5F2; font-family: 'Inter', sans-serif; color: #10192B; }
+  .fuente-display { font-family: 'Space Grotesk', sans-serif; letter-spacing: -0.01em; }
+  ::selection { background-color: #C9A24B; color: #10192B; }
 
   .ruta-linea { display: flex; align-items: center; gap: 8px; }
-  .ruta-linea .punto { width: 9px; height: 9px; border-radius: 999px; flex-shrink: 0; }
-  .ruta-linea .punto-origen { background-color: #1E8E5A; }
-  .ruta-linea .punto-destino { background-color: #FFB238; border: 2px solid #E0921A; background-color: transparent; }
-  .ruta-linea .segmento { flex: 1; border-top: 2px dashed #CBD3E1; min-width: 16px; }
+  .ruta-linea .punto { width: 8px; height: 8px; border-radius: 999px; flex-shrink: 0; }
+  .ruta-linea .punto-origen { background-color: #1F8A5F; }
+  .ruta-linea .punto-destino { width: 9px; height: 9px; background-color: transparent; border: 2px solid #C9A24B; }
+  .ruta-linea .segmento { flex: 1; border-top: 1.5px dashed #D8D4C8; min-width: 16px; }
 
   @keyframes traveling-entrada {
-    from { opacity: 0; transform: translateY(6px); }
+    from { opacity: 0; transform: translateY(8px); }
     to { opacity: 1; transform: translateY(0); }
   }
-  .anim-entrada { animation: traveling-entrada 0.25s ease-out; }
+  .anim-entrada { animation: traveling-entrada 0.35s cubic-bezier(0.16,1,0.3,1); }
 
   @keyframes traveling-toast {
     from { opacity: 0; transform: translateY(-8px) scale(0.98); }
@@ -1309,16 +1333,117 @@ const PAGINA_HTML = `<!DOCTYPE html>
   }
   .anim-toast { animation: traveling-toast 0.2s ease-out; }
 
-  .pestana-activa { color: #16305A; border-bottom: 2px solid #FFB238; }
-  .pestana-inactiva { color: #64748B; border-bottom: 2px solid transparent; }
+  .pestana-activa { color: #152238; border-bottom: 2px solid #C9A24B; font-weight: 700; }
+  .pestana-inactiva { color: #8B8D93; border-bottom: 2px solid transparent; font-weight: 600; }
+  .pestana-inactiva:hover { color: #152238; }
 
-  input:focus, select:focus, textarea:focus, button:focus-visible {
+  input, select, textarea, button { font-family: 'Inter', sans-serif; }
+
+  input:focus, select:focus, textarea:focus {
     outline: none;
-    box-shadow: 0 0 0 3px rgba(255,178,56,0.35);
+    border-color: #C9A24B !important;
+    box-shadow: 0 0 0 4px rgba(201,162,75,0.16);
+  }
+  button:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 3px rgba(201,162,75,0.35);
   }
 
   .tarjeta-rol { cursor: pointer; }
   .tarjeta-rol input { position: absolute; opacity: 0; pointer-events: none; }
+
+  /* ---------- Sistema de componentes premium ---------- */
+
+  .tarjeta {
+    background-color: #FFFFFF;
+    border-radius: 1.25rem;
+    box-shadow: 0 2px 6px rgba(16,25,43,0.05), 0 20px 48px -24px rgba(16,25,43,0.35);
+    border: 1px solid rgba(16,25,43,0.045);
+  }
+
+  .campo {
+    width: 100%;
+    border-radius: 0.85rem;
+    border: 1.5px solid #E7E4DC;
+    padding: 0.7rem 1rem;
+    font-size: 0.875rem;
+    background-color: #FFFFFF;
+    color: #10192B;
+    transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  .campo::placeholder { color: #A8A9AE; }
+
+  .etiqueta {
+    display: block;
+    font-size: 0.75rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    color: #6B7280;
+    margin-bottom: 0.4rem;
+  }
+
+  .btn {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0.4rem;
+    border-radius: 0.85rem;
+    font-weight: 700;
+    font-size: 0.875rem;
+    padding: 0.8rem 1.4rem;
+    transition: transform 0.15s cubic-bezier(0.16,1,0.3,1), box-shadow 0.2s ease, background-color 0.15s ease, opacity 0.15s ease;
+    cursor: pointer;
+    border: none;
+  }
+  .btn:active { transform: translateY(1px) scale(0.99); }
+  .btn:disabled { opacity: 0.55; cursor: not-allowed; transform: none; }
+
+  .btn-sm { padding: 0.55rem 1.1rem; font-size: 0.8125rem; border-radius: 0.7rem; }
+
+  .btn-primario { background-color: #152238; color: #FFFFFF; }
+  .btn-primario:hover { background-color: #0A1220; box-shadow: 0 10px 24px -10px rgba(21,34,56,0.55); transform: translateY(-1px); }
+
+  .btn-accent { background: linear-gradient(135deg, #D8B563, #B8902F); color: #10192B; }
+  .btn-accent:hover { box-shadow: 0 10px 24px -10px rgba(201,162,75,0.6); transform: translateY(-1px); }
+
+  .btn-oscuro { background-color: #10192B; color: #FFFFFF; }
+  .btn-oscuro:hover { background-color: #0A1220; transform: translateY(-1px); }
+
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    font-size: 0.75rem;
+    font-weight: 700;
+    border-radius: 0.65rem;
+    padding: 0.5rem 0.85rem;
+    transition: background-color 0.15s ease, transform 0.15s ease;
+    white-space: nowrap;
+    cursor: pointer;
+    border: none;
+  }
+  .chip:active { transform: scale(0.97); }
+  .chip-danger { color: #B93B2E; background-color: rgba(185,59,46,0.08); }
+  .chip-danger:hover { background-color: rgba(185,59,46,0.14); }
+  .chip-primary { color: #152238; background-color: rgba(21,34,56,0.06); }
+  .chip-primary:hover { background-color: rgba(21,34,56,0.11); }
+  .chip-success { color: #1F8A5F; background-color: rgba(31,138,95,0.09); }
+  .chip-success:hover { background-color: rgba(31,138,95,0.15); }
+
+  .insignia {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0.6875rem;
+    font-weight: 700;
+    letter-spacing: 0.03em;
+    text-transform: uppercase;
+    padding: 0.3rem 0.6rem;
+    border-radius: 999px;
+    white-space: nowrap;
+  }
+
+  #app { background-color: #F6F5F2; }
 </style>
 </head>
 <body class="min-h-screen">
@@ -1657,27 +1782,27 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
   function renderEncabezado() {
     var partes = [];
-    partes.push('<header class="bg-travel-primary text-white">');
+    partes.push('<header class="sticky top-0 z-30" style="background: linear-gradient(135deg, #152238, #0A1220); box-shadow: 0 1px 0 rgba(255,255,255,0.06), 0 12px 32px -16px rgba(10,18,32,0.6);">');
     partes.push('  <div class="max-w-5xl mx-auto px-4 sm:px-6 py-4 flex items-center justify-between">');
-    partes.push('    <div class="flex items-center gap-2">');
-    partes.push('      <svg width="26" height="26" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 12L21 4L13 22L11 13L3 12Z" stroke="#FFB238" stroke-width="1.8" stroke-linejoin="round"/></svg>');
-    partes.push('      <span class="fuente-display text-xl font-bold tracking-tight">Traveling</span>');
+    partes.push('    <div class="flex items-center gap-2.5">');
+    partes.push('      <span class="w-8 h-8 rounded-lg flex items-center justify-center" style="background: linear-gradient(135deg, #D8B563, #B8902F);"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M3 12L21 4L13 22L11 13L3 12Z" fill="#10192B"/></svg></span>');
+    partes.push('      <span class="fuente-display text-xl font-bold tracking-tight text-white">Traveling</span>');
     partes.push('    </div>');
     if (estado.usuario) {
       var inicial = escaparHTML((estado.usuario.nombre || '?').trim().charAt(0).toUpperCase());
       var notiActivas = estado.notificacionesEstado === 'granted';
       partes.push('    <div class="flex items-center gap-2 sm:gap-3">');
       if (!notiActivas) {
-        partes.push('      <button data-action="activar-notificaciones" title="Activar notificaciones" class="w-9 h-9 flex items-center justify-center rounded-full bg-white/10 hover:bg-white/20 transition text-lg">🔔</button>');
+        partes.push('      <button data-action="activar-notificaciones" title="Activar notificaciones" class="w-9 h-9 flex items-center justify-center rounded-full bg-white/10 hover:bg-white/20 transition text-base">🔔</button>');
       } else {
-        partes.push('      <span title="Notificaciones activadas" class="w-9 h-9 flex items-center justify-center rounded-full bg-travel-accent/20 text-lg">🔔</span>');
+        partes.push('      <span title="Notificaciones activadas" class="w-9 h-9 flex items-center justify-center rounded-full text-base" style="background-color: rgba(201,162,75,0.22);">🔔</span>');
       }
       partes.push('      <div class="hidden sm:flex flex-col items-end leading-tight">');
-      partes.push('        <span class="text-sm font-semibold">' + escaparHTML(estado.usuario.nombre) + '</span>');
-      partes.push('        <span class="text-xs text-white/60">' + (estado.usuario.rol === 'conductor' ? 'Conductor' : 'Pasajero') + '</span>');
+      partes.push('        <span class="text-sm font-semibold text-white">' + escaparHTML(estado.usuario.nombre) + '</span>');
+      partes.push('        <span class="text-xs" style="color: rgba(255,255,255,0.5);">' + (estado.usuario.rol === 'conductor' ? 'Conductor' : 'Pasajero') + '</span>');
       partes.push('      </div>');
-      partes.push('      <button data-action="abrir-perfil" title="Mi perfil" class="w-9 h-9 rounded-full bg-travel-accent text-travel-primarydark flex items-center justify-center font-display font-bold text-sm">' + inicial + '</button>');
-      partes.push('      <button data-action="cerrar-sesion" class="text-xs sm:text-sm font-semibold bg-white/10 hover:bg-white/20 transition rounded-lg px-3 py-2">Salir</button>');
+      partes.push('      <button data-action="abrir-perfil" title="Mi perfil" class="w-9 h-9 rounded-full text-travel-primarydark flex items-center justify-center font-display font-bold text-sm transition hover:opacity-90" style="background: linear-gradient(135deg, #D8B563, #B8902F); box-shadow: 0 0 0 2px rgba(255,255,255,0.15);">' + inicial + '</button>');
+      partes.push('      <button data-action="cerrar-sesion" class="text-xs sm:text-sm font-semibold text-white/85 hover:text-white transition rounded-lg px-3 py-2 hover:bg-white/8" style="border: 1px solid rgba(255,255,255,0.15);">Salir</button>');
       partes.push('    </div>');
     }
     partes.push('  </div>');
@@ -1691,16 +1816,17 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
   function vistaAuth() {
     var p = [];
-    p.push('<div class="max-w-md mx-auto px-4 sm:px-6 py-10 sm:py-16 anim-entrada">');
+    p.push('<div class="max-w-md mx-auto px-4 sm:px-6 py-12 sm:py-20 anim-entrada">');
 
-    p.push('  <div class="text-center mb-8">');
-    p.push('    <h1 class="fuente-display text-3xl font-bold text-travel-ink">Viaja acompañado</h1>');
-    p.push('    <p class="text-travel-muted mt-2">Conductores y pasajeros conectados sin llamadas ni anotaciones.</p>');
+    p.push('  <div class="text-center mb-10">');
+    p.push('    <span class="insignia mb-4" style="background-color: rgba(201,162,75,0.14); color: #A9822E;">✦ Transporte compartido</span>');
+    p.push('    <h1 class="fuente-display text-4xl font-bold text-travel-ink leading-tight mt-4">Viaja <span style="color: #B8902F;">acompañado</span></h1>');
+    p.push('    <p class="text-travel-muted mt-3 text-[15px]">Conductores y pasajeros conectados sin llamadas ni anotaciones.</p>');
     p.push('  </div>');
 
     p.push('  <div class="flex border-b border-travel-line mb-6">');
-    p.push('    <button data-action="mostrar-login" class="flex-1 py-3 text-sm font-semibold ' + (estado.authTab === 'login' ? 'pestana-activa' : 'pestana-inactiva') + '">Iniciar sesión</button>');
-    p.push('    <button data-action="mostrar-registro" class="flex-1 py-3 text-sm font-semibold ' + (estado.authTab === 'registro' ? 'pestana-activa' : 'pestana-inactiva') + '">Crear cuenta</button>');
+    p.push('    <button data-action="mostrar-login" class="flex-1 py-3 text-sm ' + (estado.authTab === 'login' ? 'pestana-activa' : 'pestana-inactiva') + '">Iniciar sesión</button>');
+    p.push('    <button data-action="mostrar-registro" class="flex-1 py-3 text-sm ' + (estado.authTab === 'registro' ? 'pestana-activa' : 'pestana-inactiva') + '">Crear cuenta</button>');
     p.push('  </div>');
 
     if (estado.authTab === 'login') {
@@ -1715,16 +1841,16 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
   function formularioLogin() {
     var p = [];
-    p.push('<form id="form-login" class="bg-white rounded-2xl shadow-card p-6 flex flex-col gap-4">');
+    p.push('<form id="form-login" class="tarjeta p-6 flex flex-col gap-4">');
     p.push('  <div>');
-    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">Correo electrónico</label>');
-    p.push('    <input type="email" name="email" required autocomplete="email" placeholder="tucorreo@ejemplo.com" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('    <label class="etiqueta">Correo electrónico</label>');
+    p.push('    <input type="email" name="email" required autocomplete="email" placeholder="tucorreo@ejemplo.com" class="campo">');
     p.push('  </div>');
     p.push('  <div>');
-    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">Contraseña</label>');
-    p.push('    <input type="password" name="password" required autocomplete="current-password" placeholder="••••••••" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('    <label class="etiqueta">Contraseña</label>');
+    p.push('    <input type="password" name="password" required autocomplete="current-password" placeholder="••••••••" class="campo">');
     p.push('  </div>');
-    p.push('  <button type="submit" class="mt-2 bg-travel-primary hover:bg-travel-primarydark transition text-white font-semibold rounded-xl py-3 text-sm">Iniciar sesión</button>');
+    p.push('  <button type="submit" class="mt-2 btn btn-primario">Iniciar sesión</button>');
     p.push('</form>');
     return p.join('');
   }
@@ -1732,7 +1858,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
   function formularioRegistro() {
     var esConductor = estado.registroRol === 'conductor';
     var p = [];
-    p.push('<form id="form-registro" class="bg-white rounded-2xl shadow-card p-6 flex flex-col gap-4">');
+    p.push('<form id="form-registro" class="tarjeta p-6 flex flex-col gap-4">');
 
     p.push('  <div>');
     p.push('    <label class="block text-sm font-medium text-travel-ink mb-2">¿Cómo quieres usar Traveling?</label>');
@@ -1751,42 +1877,42 @@ const PAGINA_HTML = `<!DOCTYPE html>
     p.push('  </div>');
 
     p.push('  <div>');
-    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">Nombre completo</label>');
-    p.push('    <input type="text" name="nombre" required minlength="2" maxlength="150" placeholder="Ej. Camila Ramírez" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('    <label class="etiqueta">Nombre completo</label>');
+    p.push('    <input type="text" name="nombre" required minlength="2" maxlength="150" placeholder="Ej. Camila Ramírez" class="campo">');
     p.push('  </div>');
     p.push('  <div>');
-    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">Teléfono</label>');
-    p.push('    <input type="tel" name="telefono" required minlength="6" maxlength="30" placeholder="Ej. 3001234567" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('    <label class="etiqueta">Teléfono</label>');
+    p.push('    <input type="tel" name="telefono" required minlength="6" maxlength="30" placeholder="Ej. 3001234567" class="campo">');
     p.push('  </div>');
     p.push('  <div>');
-    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">Correo electrónico</label>');
-    p.push('    <input type="email" name="email" required placeholder="tucorreo@ejemplo.com" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('    <label class="etiqueta">Correo electrónico</label>');
+    p.push('    <input type="email" name="email" required placeholder="tucorreo@ejemplo.com" class="campo">');
     p.push('  </div>');
     p.push('  <div>');
-    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">Contraseña</label>');
-    p.push('    <input type="password" name="password" required minlength="6" placeholder="Mínimo 6 caracteres" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('    <label class="etiqueta">Contraseña</label>');
+    p.push('    <input type="password" name="password" required minlength="6" placeholder="Mínimo 6 caracteres" class="campo">');
     p.push('  </div>');
 
     p.push('  <div id="campos-vehiculo" class="flex flex-col gap-4 ' + (esConductor ? '' : 'hidden') + '">');
     p.push('    <div class="h-px bg-travel-line my-1"></div>');
     p.push('    <p class="text-xs font-semibold text-travel-muted uppercase tracking-wide">Datos de tu vehículo</p>');
     p.push('    <div>');
-    p.push('      <label class="block text-sm font-medium text-travel-ink mb-1">Modelo del vehículo</label>');
-    p.push('      <input type="text" name="vehiculo_modelo" ' + (esConductor ? 'required' : '') + ' maxlength="100" placeholder="Ej. Chevrolet Spark 2020" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('      <label class="etiqueta">Modelo del vehículo</label>');
+    p.push('      <input type="text" name="vehiculo_modelo" ' + (esConductor ? 'required' : '') + ' maxlength="100" placeholder="Ej. Chevrolet Spark 2020" class="campo">');
     p.push('    </div>');
     p.push('    <div class="grid grid-cols-2 gap-3">');
     p.push('      <div>');
-    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Placa</label>');
-    p.push('        <input type="text" name="vehiculo_placa" ' + (esConductor ? 'required' : '') + ' maxlength="20" placeholder="ABC123" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm uppercase">');
+    p.push('        <label class="etiqueta">Placa</label>');
+    p.push('        <input type="text" name="vehiculo_placa" ' + (esConductor ? 'required' : '') + ' maxlength="20" placeholder="ABC123" class="campo uppercase">');
     p.push('      </div>');
     p.push('      <div>');
-    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Capacidad</label>');
-    p.push('        <input type="number" name="capacidad_puestos" ' + (esConductor ? 'required' : '') + ' min="1" max="20" placeholder="Ej. 4" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('        <label class="etiqueta">Capacidad</label>');
+    p.push('        <input type="number" name="capacidad_puestos" ' + (esConductor ? 'required' : '') + ' min="1" max="20" placeholder="Ej. 4" class="campo">');
     p.push('      </div>');
     p.push('    </div>');
     p.push('  </div>');
 
-    p.push('  <button type="submit" class="mt-2 bg-travel-primary hover:bg-travel-primarydark transition text-white font-semibold rounded-xl py-3 text-sm">Crear cuenta</button>');
+    p.push('  <button type="submit" class="mt-2 btn btn-primario">Crear cuenta</button>');
     p.push('</form>');
     return p.join('');
   }
@@ -1822,42 +1948,42 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
   function formularioPublicarViaje() {
     var p = [];
-    p.push('<form id="form-publicar-viaje" class="bg-white rounded-2xl shadow-card p-6 flex flex-col gap-4 max-w-lg">');
+    p.push('<form id="form-publicar-viaje" class="tarjeta p-6 flex flex-col gap-4 max-w-lg">');
     p.push('  <div class="grid grid-cols-2 gap-3">');
     p.push('    <div>');
-    p.push('      <label class="block text-sm font-medium text-travel-ink mb-1">Origen</label>');
-    p.push('      <input type="text" name="origen" required minlength="2" maxlength="150" placeholder="Ej. Medellín" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('      <label class="etiqueta">Origen</label>');
+    p.push('      <input type="text" name="origen" required minlength="2" maxlength="150" placeholder="Ej. Medellín" class="campo">');
     p.push('    </div>');
     p.push('    <div>');
-    p.push('      <label class="block text-sm font-medium text-travel-ink mb-1">Destino</label>');
-    p.push('      <input type="text" name="destino" required minlength="2" maxlength="150" placeholder="Ej. Bogotá" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('      <label class="etiqueta">Destino</label>');
+    p.push('      <input type="text" name="destino" required minlength="2" maxlength="150" placeholder="Ej. Bogotá" class="campo">');
     p.push('    </div>');
     p.push('  </div>');
     p.push('  <div>');
-    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">Hora de salida</label>');
+    p.push('    <label class="etiqueta">Hora de salida</label>');
     p.push('    <input type="time" name="hora_salida" required class="w-full sm:w-48 rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
     p.push('  </div>');
     p.push('  <div>');
-    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">¿Qué días de la semana circulas?</label>');
+    p.push('    <label class="etiqueta">¿Qué días de la semana circulas?</label>');
     p.push('    <p class="text-xs text-travel-muted mb-2">Se publican las salidas de esta semana (domingo a sábado) en esos días. La próxima semana debes volver a publicar.</p>');
     p.push(casillasDias('dias_semana', 'travel-primary'));
     p.push('  </div>');
     p.push('  <div>');
-    p.push('    <label class="block text-sm font-medium text-travel-ink mb-1">¿Tienes pico y placa? <span class="font-normal text-travel-muted">(opcional)</span></label>');
+    p.push('    <label class="etiqueta">¿Tienes pico y placa? <span class="font-normal text-travel-muted">(opcional)</span></label>');
     p.push('    <p class="text-xs text-travel-muted mb-2">Marca el día que tu vehículo no puede circular. Los pasajeros lo verán marcado como "EN PICO Y PLACA".</p>');
     p.push(casillasDias('pico_placa_dias', 'travel-danger'));
     p.push('  </div>');
     p.push('  <div class="grid grid-cols-2 gap-3">');
     p.push('    <div>');
-    p.push('      <label class="block text-sm font-medium text-travel-ink mb-1">Puestos disponibles</label>');
-    p.push('      <input type="number" name="puestos_disponibles" required min="1" max="' + (estado.usuario.capacidad_puestos || 20) + '" placeholder="Ej. 3" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('      <label class="etiqueta">Puestos disponibles</label>');
+    p.push('      <input type="number" name="puestos_disponibles" required min="1" max="' + (estado.usuario.capacidad_puestos || 20) + '" placeholder="Ej. 3" class="campo">');
     p.push('    </div>');
     p.push('    <div>');
-    p.push('      <label class="block text-sm font-medium text-travel-ink mb-1">Precio por puesto (COP)</label>');
-    p.push('      <input type="number" name="precio" required min="0" step="1000" placeholder="Ej. 35000" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('      <label class="etiqueta">Precio por puesto (COP)</label>');
+    p.push('      <input type="number" name="precio" required min="0" step="1000" placeholder="Ej. 35000" class="campo">');
     p.push('    </div>');
     p.push('  </div>');
-    p.push('  <button type="submit" class="mt-2 bg-travel-accent hover:bg-travel-accentdark transition text-travel-primarydark font-bold rounded-xl py-3 text-sm">Publicar viaje</button>');
+    p.push('  <button type="submit" class="mt-2 btn btn-accent">Publicar viaje</button>');
     p.push('</form>');
     return p.join('');
   }
@@ -1880,12 +2006,12 @@ const PAGINA_HTML = `<!DOCTYPE html>
       var v = estado.misViajes[i];
       var expandido = !!estado.viajeExpandido[v.id];
       var estadoBadge = v.estado === 'activo'
-        ? '<span class="text-xs font-semibold px-2 py-1 rounded-full bg-travel-success/10 text-travel-success">Activo</span>'
+        ? '<span class="insignia bg-travel-success/10 text-travel-success">Activo</span>'
         : v.estado === 'cancelado'
-          ? '<span class="text-xs font-semibold px-2 py-1 rounded-full bg-travel-danger/10 text-travel-danger">Cancelado</span>'
-          : '<span class="text-xs font-semibold px-2 py-1 rounded-full bg-travel-muted/10 text-travel-muted">Completado</span>';
+          ? '<span class="insignia bg-travel-danger/10 text-travel-danger">Cancelado</span>'
+          : '<span class="insignia bg-travel-muted/10 text-travel-muted">Completado</span>';
 
-      p.push('<div class="bg-white rounded-2xl shadow-card p-5">');
+      p.push('<div class="tarjeta p-5">');
       p.push('  <div class="flex items-start justify-between gap-3">');
       p.push('    <div class="flex-1">');
       p.push('      <div class="ruta-linea mb-2">');
@@ -1904,10 +2030,13 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('  </div>');
 
       p.push('  <div class="flex items-center gap-2 mt-4 flex-wrap">');
-      p.push('    <button data-action="ver-pasajeros" data-id="' + v.id + '" class="text-xs font-semibold text-travel-primary bg-travel-primary/5 hover:bg-travel-primary/10 transition rounded-lg px-3 py-2">' + (expandido ? 'Ocultar pasajeros' : 'Ver pasajeros (' + (v.reservas_confirmadas || 0) + ')') + '</button>');
+      p.push('    <button data-action="ver-pasajeros" data-id="' + v.id + '" class="chip chip-primary">' + (expandido ? 'Ocultar pasajeros' : 'Ver pasajeros (' + (v.reservas_confirmadas || 0) + ')') + '</button>');
       if (v.estado === 'activo') {
-        p.push('    <button data-action="editar-viaje" data-id="' + v.id + '" class="text-xs font-semibold text-travel-ink bg-travel-ink/5 hover:bg-travel-ink/10 transition rounded-lg px-3 py-2">Editar</button>');
-        p.push('    <button data-action="cancelar-viaje" data-id="' + v.id + '" class="text-xs font-semibold text-travel-danger bg-travel-danger/5 hover:bg-travel-danger/10 transition rounded-lg px-3 py-2">Cancelar viaje</button>');
+        if (v.fecha_salida <= fechaMinima()) {
+          p.push('    <button data-action="finalizar-viaje" data-id="' + v.id + '" class="chip chip-success">✓ Finalizar viaje</button>');
+        }
+        p.push('    <button data-action="editar-viaje" data-id="' + v.id + '" class="chip chip-primary">Editar</button>');
+        p.push('    <button data-action="cancelar-viaje" data-id="' + v.id + '" class="chip chip-danger">Cancelar viaje</button>');
       }
       p.push('  </div>');
 
@@ -1939,10 +2068,10 @@ const PAGINA_HTML = `<!DOCTYPE html>
       var v = estado.historialViajes[i];
       var expandido = !!estado.viajeExpandido[v.id];
       var estadoBadge = v.estado === 'cancelado'
-        ? '<span class="text-xs font-semibold px-2 py-1 rounded-full bg-travel-danger/10 text-travel-danger">Cancelado</span>'
-        : '<span class="text-xs font-semibold px-2 py-1 rounded-full bg-travel-muted/10 text-travel-muted">Completado</span>';
+        ? '<span class="insignia bg-travel-danger/10 text-travel-danger">Cancelado</span>'
+        : '<span class="insignia bg-travel-muted/10 text-travel-muted">Completado</span>';
 
-      p.push('<div class="bg-white rounded-2xl shadow-card p-5 opacity-90">');
+      p.push('<div class="tarjeta p-5 opacity-90">');
       p.push('  <div class="flex items-start justify-between gap-3">');
       p.push('    <div class="flex-1">');
       p.push('      <div class="flex items-center gap-2 flex-wrap">');
@@ -1953,7 +2082,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('    </div>');
       p.push('  </div>');
       p.push('  <div class="flex items-center gap-2 mt-4">');
-      p.push('    <button data-action="ver-pasajeros" data-id="' + v.id + '" class="text-xs font-semibold text-travel-primary bg-travel-primary/5 hover:bg-travel-primary/10 transition rounded-lg px-3 py-2">' + (expandido ? 'Ocultar pasajeros' : 'Ver pasajeros (' + (v.reservas_confirmadas || 0) + ')') + '</button>');
+      p.push('    <button data-action="ver-pasajeros" data-id="' + v.id + '" class="chip chip-primary">' + (expandido ? 'Ocultar pasajeros' : 'Ver pasajeros (' + (v.reservas_confirmadas || 0) + ')') + '</button>');
       p.push('  </div>');
       if (expandido) {
         p.push('  <div class="mt-4 border-t border-travel-line pt-4">');
@@ -1984,23 +2113,23 @@ const PAGINA_HTML = `<!DOCTYPE html>
     p.push('    <form id="form-editar-viaje" class="flex flex-col gap-4">');
     p.push('      <input type="hidden" name="viaje_id" value="' + viaje.id + '">');
     p.push('      <div>');
-    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Hora de salida</label>');
-    p.push('        <input type="time" name="hora_salida" required value="' + formatearHora(viaje.hora_salida) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('        <label class="etiqueta">Hora de salida</label>');
+    p.push('        <input type="time" name="hora_salida" required value="' + formatearHora(viaje.hora_salida) + '" class="campo">');
     p.push('      </div>');
     p.push('      <div class="grid grid-cols-2 gap-3">');
     p.push('        <div>');
-    p.push('          <label class="block text-sm font-medium text-travel-ink mb-1">Puestos totales</label>');
-    p.push('          <input type="number" name="puestos_totales" required min="1" max="20" value="' + viaje.puestos_totales + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('          <label class="etiqueta">Puestos totales</label>');
+    p.push('          <input type="number" name="puestos_totales" required min="1" max="20" value="' + viaje.puestos_totales + '" class="campo">');
     p.push('        </div>');
     p.push('        <div>');
-    p.push('          <label class="block text-sm font-medium text-travel-ink mb-1">Precio por puesto</label>');
-    p.push('          <input type="number" name="precio" required min="0" step="1000" value="' + viaje.precio + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('          <label class="etiqueta">Precio por puesto</label>');
+    p.push('          <input type="number" name="precio" required min="0" step="1000" value="' + viaje.precio + '" class="campo">');
     p.push('        </div>');
     p.push('      </div>');
     if (viaje.puestos_totales - viaje.puestos_disponibles > 0) {
       p.push('      <p class="text-xs text-travel-muted">Ya hay ' + (viaje.puestos_totales - viaje.puestos_disponibles) + ' puesto(s) reservado(s): no puedes bajar de esa cantidad.</p>');
     }
-    p.push('      <button type="submit" class="bg-travel-primary hover:bg-travel-primarydark transition text-white font-semibold rounded-xl py-3 text-sm">Guardar cambios</button>');
+    p.push('      <button type="submit" class="btn btn-primario">Guardar cambios</button>');
     p.push('    </form>');
     p.push('  </div>');
     p.push('</div>');
@@ -2026,7 +2155,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('  </div>');
       p.push('  <div class="text-right shrink-0 flex flex-col items-end gap-1.5">');
       p.push('    <a href="tel:' + escaparHTML(r.pasajero_telefono) + '" class="text-xs font-semibold text-travel-primary whitespace-nowrap">' + escaparHTML(r.pasajero_telefono) + '</a>');
-      p.push('    <button data-action="cancelar-reserva-conductor" data-id="' + r.id + '" data-total="' + r.puestos_reservados + '" class="text-xs font-semibold text-travel-danger bg-travel-danger/5 hover:bg-travel-danger/10 transition rounded-lg px-2 py-1 whitespace-nowrap">Cancelar</button>');
+      p.push('    <button data-action="cancelar-reserva-conductor" data-id="' + r.id + '" data-total="' + r.puestos_reservados + '" class="chip chip-danger">Cancelar</button>');
       p.push('  </div>');
       p.push('</div>');
     }
@@ -2068,11 +2197,11 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
   function formularioBusqueda() {
     var p = [];
-    p.push('<form id="form-busqueda" class="bg-white rounded-2xl shadow-card p-4 sm:p-5 flex flex-col sm:flex-row gap-3">');
+    p.push('<form id="form-busqueda" class="tarjeta p-4 sm:p-5 flex flex-col sm:flex-row gap-3">');
     p.push('  <input type="text" name="origen" placeholder="Origen" class="flex-1 rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
     p.push('  <input type="text" name="destino" placeholder="Destino" class="flex-1 rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
     p.push('  <input type="date" name="fecha" min="' + fechaMinima() + '" class="rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
-    p.push('  <button type="submit" class="bg-travel-primary hover:bg-travel-primarydark transition text-white font-semibold rounded-xl px-5 py-2.5 text-sm whitespace-nowrap">Buscar</button>');
+    p.push('  <button type="submit" class="btn btn-sm btn-primario whitespace-nowrap">Buscar</button>');
     p.push('</form>');
     return p.join('');
   }
@@ -2094,7 +2223,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
     for (var i = 0; i < estado.viajesBusqueda.length; i++) {
       var v = estado.viajesBusqueda[i];
       var inicial = escaparHTML((v.conductor_nombre || '?').trim().charAt(0).toUpperCase());
-      p.push('<div class="bg-white rounded-2xl shadow-card p-5 flex flex-col gap-4">');
+      p.push('<div class="tarjeta p-5 flex flex-col gap-4">');
       p.push('  <div class="flex items-start justify-between gap-3">');
       p.push('    <div class="flex-1">');
       p.push('      <div class="ruta-linea mb-2">');
@@ -2119,15 +2248,15 @@ const PAGINA_HTML = `<!DOCTYPE html>
       } else if (v.puestos_disponibles > 0) {
         p.push('    <div class="text-right">');
         p.push('      <p class="text-xs text-travel-muted mb-1">' + v.puestos_disponibles + ' puesto(s) libres</p>');
-        p.push('      <button data-action="abrir-modal-reserva" data-id="' + v.id + '" class="bg-travel-accent hover:bg-travel-accentdark transition text-travel-primarydark font-bold rounded-xl px-4 py-2 text-sm">Reservar</button>');
+        p.push('      <button data-action="abrir-modal-reserva" data-id="' + v.id + '" class="btn btn-sm btn-accent">Reservar</button>');
         p.push('    </div>');
       } else {
         p.push('    <div class="text-right">');
         p.push('      <p class="text-xs text-travel-muted mb-1">Sin cupo por ahora</p>');
         if (v.tiene_aviso) {
-          p.push('      <button data-action="quitar-aviso-cupo" data-id="' + v.id + '" class="bg-travel-success/10 text-travel-success font-bold rounded-xl px-3 py-2 text-xs whitespace-nowrap">🔔 Te avisaremos</button>');
+          p.push('      <button data-action="quitar-aviso-cupo" data-id="' + v.id + '" class="chip chip-success">🔔 Te avisaremos</button>');
         } else {
-          p.push('      <button data-action="avisar-cupo" data-id="' + v.id + '" class="bg-travel-primary/10 text-travel-primary font-bold rounded-xl px-3 py-2 text-xs whitespace-nowrap">🔔 Avisarme si hay cupo</button>');
+          p.push('      <button data-action="avisar-cupo" data-id="' + v.id + '" class="chip chip-primary">🔔 Avisarme si hay cupo</button>');
         }
         p.push('    </div>');
       }
@@ -2156,14 +2285,14 @@ const PAGINA_HTML = `<!DOCTYPE html>
     p.push('    <form id="form-reservar" class="flex flex-col gap-4">');
     p.push('      <input type="hidden" name="viaje_id" value="' + viaje.id + '">');
     p.push('      <div>');
-    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Puestos a reservar</label>');
-    p.push('        <input type="number" name="puestos_reservados" required min="1" max="' + viaje.puestos_disponibles + '" value="1" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('        <label class="etiqueta">Puestos a reservar</label>');
+    p.push('        <input type="number" name="puestos_reservados" required min="1" max="' + viaje.puestos_disponibles + '" value="1" class="campo">');
     p.push('      </div>');
     p.push('      <div>');
-    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Tu punto exacto de recogida</label>');
-    p.push('        <textarea name="punto_recogida" required minlength="3" maxlength="255" rows="2" placeholder="Ej. Carrera 43A #5-15, El Poblado" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm"></textarea>');
+    p.push('        <label class="etiqueta">Tu punto exacto de recogida</label>');
+    p.push('        <textarea name="punto_recogida" required minlength="3" maxlength="255" rows="2" placeholder="Ej. Carrera 43A #5-15, El Poblado" class="campo"></textarea>');
     p.push('      </div>');
-    p.push('      <button type="submit" class="bg-travel-primary hover:bg-travel-primarydark transition text-white font-semibold rounded-xl py-3 text-sm">Confirmar reserva</button>');
+    p.push('      <button type="submit" class="btn btn-primario">Confirmar reserva</button>');
     p.push('    </form>');
     p.push('  </div>');
     p.push('</div>');
@@ -2184,44 +2313,44 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
     p.push('    <form id="form-editar-perfil" class="flex flex-col gap-4">');
     p.push('      <div>');
-    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Nombre completo</label>');
-    p.push('        <input type="text" name="nombre" required minlength="2" maxlength="150" value="' + escaparHTML(u.nombre) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('        <label class="etiqueta">Nombre completo</label>');
+    p.push('        <input type="text" name="nombre" required minlength="2" maxlength="150" value="' + escaparHTML(u.nombre) + '" class="campo">');
     p.push('      </div>');
     p.push('      <div>');
-    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Teléfono</label>');
-    p.push('        <input type="tel" name="telefono" required minlength="6" maxlength="30" value="' + escaparHTML(u.telefono) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('        <label class="etiqueta">Teléfono</label>');
+    p.push('        <input type="tel" name="telefono" required minlength="6" maxlength="30" value="' + escaparHTML(u.telefono) + '" class="campo">');
     p.push('      </div>');
     p.push('      <div>');
-    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Correo</label>');
-    p.push('        <input type="email" disabled value="' + escaparHTML(u.email) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm bg-travel-bg text-travel-muted">');
+    p.push('        <label class="etiqueta">Correo</label>');
+    p.push('        <input type="email" disabled value="' + escaparHTML(u.email) + '" class="campo bg-travel-bg text-travel-muted">');
     p.push('      </div>');
     if (esConductor) {
       p.push('      <div class="h-px bg-travel-line my-1"></div>');
       p.push('      <p class="text-xs font-semibold text-travel-muted uppercase tracking-wide">Datos de tu vehículo</p>');
       p.push('      <div>');
-      p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Modelo del vehículo</label>');
-      p.push('        <input type="text" name="vehiculo_modelo" required maxlength="100" value="' + escaparHTML(u.vehiculo_modelo) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+      p.push('        <label class="etiqueta">Modelo del vehículo</label>');
+      p.push('        <input type="text" name="vehiculo_modelo" required maxlength="100" value="' + escaparHTML(u.vehiculo_modelo) + '" class="campo">');
       p.push('      </div>');
       p.push('      <div class="grid grid-cols-2 gap-3">');
       p.push('        <div>');
-      p.push('          <label class="block text-sm font-medium text-travel-ink mb-1">Placa</label>');
-      p.push('          <input type="text" name="vehiculo_placa" required maxlength="20" value="' + escaparHTML(u.vehiculo_placa) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm uppercase">');
+      p.push('          <label class="etiqueta">Placa</label>');
+      p.push('          <input type="text" name="vehiculo_placa" required maxlength="20" value="' + escaparHTML(u.vehiculo_placa) + '" class="campo uppercase">');
       p.push('        </div>');
       p.push('        <div>');
-      p.push('          <label class="block text-sm font-medium text-travel-ink mb-1">Capacidad</label>');
-      p.push('          <input type="number" name="capacidad_puestos" required min="1" max="20" value="' + escaparHTML(u.capacidad_puestos) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+      p.push('          <label class="etiqueta">Capacidad</label>');
+      p.push('          <input type="number" name="capacidad_puestos" required min="1" max="20" value="' + escaparHTML(u.capacidad_puestos) + '" class="campo">');
       p.push('        </div>');
       p.push('      </div>');
     }
-    p.push('      <button type="submit" class="bg-travel-primary hover:bg-travel-primarydark transition text-white font-semibold rounded-xl py-3 text-sm">Guardar cambios</button>');
+    p.push('      <button type="submit" class="btn btn-primario">Guardar cambios</button>');
     p.push('    </form>');
 
     p.push('    <div class="h-px bg-travel-line my-5"></div>');
     p.push('    <p class="text-xs font-semibold text-travel-muted uppercase tracking-wide mb-3">Cambiar contraseña</p>');
     p.push('    <form id="form-cambiar-password" class="flex flex-col gap-3">');
-    p.push('      <input type="password" name="password_actual" required placeholder="Contraseña actual" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
-    p.push('      <input type="password" name="password_nueva" required minlength="6" placeholder="Contraseña nueva (mínimo 6 caracteres)" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
-    p.push('      <button type="submit" class="bg-travel-ink hover:bg-travel-primarydark transition text-white font-semibold rounded-xl py-3 text-sm">Cambiar contraseña</button>');
+    p.push('      <input type="password" name="password_actual" required placeholder="Contraseña actual" class="campo">');
+    p.push('      <input type="password" name="password_nueva" required minlength="6" placeholder="Contraseña nueva (mínimo 6 caracteres)" class="campo">');
+    p.push('      <button type="submit" class="btn btn-oscuro">Cambiar contraseña</button>');
     p.push('    </form>');
 
     p.push('  </div>');
@@ -2248,7 +2377,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
       else if (r.viaje_estado === 'cancelado') { estadoTexto = 'Viaje cancelado'; estadoClase = 'bg-travel-danger/10 text-travel-danger'; }
       else { estadoTexto = 'Confirmada'; estadoClase = 'bg-travel-success/10 text-travel-success'; }
 
-      p.push('<div class="bg-white rounded-2xl shadow-card p-5">');
+      p.push('<div class="tarjeta p-5">');
       p.push('  <div class="flex items-start justify-between gap-3">');
       p.push('    <div>');
       p.push('      <p class="font-display font-bold text-travel-ink">' + escaparHTML(r.origen) + ' → ' + escaparHTML(r.destino) + '</p>');
@@ -2256,11 +2385,11 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('      <p class="text-sm text-travel-muted">Recogida: ' + escaparHTML(r.punto_recogida) + '</p>');
       p.push('      <p class="text-sm text-travel-muted">Conductor: ' + escaparHTML(r.conductor_nombre) + ' · ' + escaparHTML(r.conductor_telefono) + '</p>');
       p.push('    </div>');
-      p.push('    <span class="text-xs font-semibold px-2 py-1 rounded-full whitespace-nowrap ' + estadoClase + '">' + estadoTexto + '</span>');
+      p.push('    <span class="insignia whitespace-nowrap ' + estadoClase + '">' + estadoTexto + '</span>');
       p.push('  </div>');
       if (r.estado === 'confirmada' && r.viaje_estado === 'activo') {
         p.push('  <div class="mt-3 pt-3 border-t border-travel-line">');
-        p.push('    <button data-action="cancelar-reserva" data-id="' + r.id + '" data-total="' + r.puestos_reservados + '" class="text-xs font-semibold text-travel-danger bg-travel-danger/5 hover:bg-travel-danger/10 transition rounded-lg px-3 py-2">Cancelar reserva</button>');
+        p.push('    <button data-action="cancelar-reserva" data-id="' + r.id + '" data-total="' + r.puestos_reservados + '" class="chip chip-danger">Cancelar reserva</button>');
         p.push('  </div>');
       }
       p.push('</div>');
@@ -2288,14 +2417,14 @@ const PAGINA_HTML = `<!DOCTYPE html>
       else if (r.viaje_estado === 'cancelado') { estadoTexto = 'Viaje cancelado'; estadoClase = 'bg-travel-danger/10 text-travel-danger'; }
       else { estadoTexto = 'Completado'; estadoClase = 'bg-travel-muted/10 text-travel-muted'; }
 
-      p.push('<div class="bg-white rounded-2xl shadow-card p-5 opacity-90">');
+      p.push('<div class="tarjeta p-5 opacity-90">');
       p.push('  <div class="flex items-start justify-between gap-3">');
       p.push('    <div>');
       p.push('      <p class="font-display font-bold text-travel-ink">' + escaparHTML(r.origen) + ' → ' + escaparHTML(r.destino) + '</p>');
       p.push('      <p class="text-sm text-travel-muted mt-1">' + formatearFecha(r.fecha_salida) + ' · ' + formatearHora(r.hora_salida) + ' · ' + r.puestos_reservados + ' puesto(s)</p>');
       p.push('      <p class="text-sm text-travel-muted">Conductor: ' + escaparHTML(r.conductor_nombre) + '</p>');
       p.push('    </div>');
-      p.push('    <span class="text-xs font-semibold px-2 py-1 rounded-full whitespace-nowrap ' + estadoClase + '">' + estadoTexto + '</span>');
+      p.push('    <span class="insignia whitespace-nowrap ' + estadoClase + '">' + estadoTexto + '</span>');
       p.push('  </div>');
       p.push('</div>');
     }
@@ -2411,6 +2540,16 @@ const PAGINA_HTML = `<!DOCTYPE html>
   function confirmarCancelarViaje(viajeId) {
     if (!window.confirm('¿Seguro que deseas cancelar este viaje? Se notificará el cambio a los pasajeros.')) return;
     api('/viajes/' + viajeId + '/cancelar', { method: 'PATCH' }).then(function (datos) {
+      mostrarToast(datos.mensaje, 'exito');
+      cargarMisViajes(false);
+    }).catch(function (err) {
+      mostrarToast(err.message, 'error');
+    });
+  }
+
+  function confirmarFinalizarViaje(viajeId) {
+    if (!window.confirm('¿Ya llegaste a tu destino? Esto cierra el viaje y lo pasa a tu historial.')) return;
+    api('/viajes/' + viajeId + '/finalizar', { method: 'PATCH' }).then(function (datos) {
       mostrarToast(datos.mensaje, 'exito');
       cargarMisViajes(false);
     }).catch(function (err) {
@@ -2690,6 +2829,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
     else if (accion === 'tab-pasajero-historial') { estado.pasajeroTab = 'historial'; cargarHistorialReservas(); }
     else if (accion === 'ver-pasajeros') { alternarDetallePasajeros(id); }
     else if (accion === 'cancelar-viaje') { confirmarCancelarViaje(id); }
+    else if (accion === 'finalizar-viaje') { confirmarFinalizarViaje(id); }
     else if (accion === 'editar-viaje') { abrirModalEditarViaje(id); }
     else if (accion === 'cerrar-modal-editar-viaje') { estado.modalEditarViajeId = null; render(); }
     else if (accion === 'abrir-modal-reserva') { abrirModalReserva(id); }
