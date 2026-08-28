@@ -2423,10 +2423,10 @@ const PAGINA_HTML = `<!DOCTYPE html>
         p.push('      <p class="text-sm text-travel-muted mt-1">' + formatearFecha(v.fecha_salida) + ' · ' + formatearHora(v.hora_salida) + '</p>');
         p.push('    </div>');
         p.push('    <div class="text-right shrink-0">');
-        p.push('      <p class="font-display font-bold text-travel-accent text-lg">' + formatearPrecio(v.precio) + '</p>');
         if (!v.pico_y_placa) {
-          p.push('      <p class="text-xs text-travel-muted mt-0.5">' + v.puestos_disponibles + ' puesto(s) libre(s)</p>');
+          p.push('      <p class="font-display font-bold text-travel-accent text-lg">' + v.puestos_disponibles + ' puesto(s) libre(s)</p>');
         }
+        p.push('      <p class="text-xs text-travel-muted mt-0.5">' + formatearPrecio(v.precio) + '</p>');
         p.push('    </div>');
         p.push('  </div>');
 
