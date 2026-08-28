@@ -549,6 +549,75 @@ app.get('/api/auth/perfil', autenticar, manejadorAsincrono(async (req, res) => {
   res.json({ ok: true, usuario });
 }));
 
+app.put('/api/auth/perfil', autenticar, manejadorAsincrono(async (req, res) => {
+  const cuerpo = req.body || {};
+  const nombre = String(cuerpo.nombre || '').trim();
+  const telefono = String(cuerpo.telefono || '').trim();
+
+  if (!textoValido(nombre, 2, 150)) {
+    return res.status(400).json({ ok: false, mensaje: 'Ingresa un nombre válido.' });
+  }
+  if (!textoValido(telefono, 6, 30)) {
+    return res.status(400).json({ ok: false, mensaje: 'Ingresa un teléfono válido.' });
+  }
+
+  let vehiculoModelo = null;
+  let vehiculoPlaca = null;
+  let capacidadPuestos = null;
+
+  if (req.usuario.rol === 'conductor') {
+    vehiculoModelo = String(cuerpo.vehiculo_modelo || '').trim();
+    vehiculoPlaca = String(cuerpo.vehiculo_placa || '').trim().toUpperCase();
+    capacidadPuestos = cuerpo.capacidad_puestos;
+
+    if (!textoValido(vehiculoModelo, 2, 100)) {
+      return res.status(400).json({ ok: false, mensaje: 'Ingresa el modelo de tu vehículo.' });
+    }
+    if (!textoValido(vehiculoPlaca, 3, 20)) {
+      return res.status(400).json({ ok: false, mensaje: 'Ingresa la placa de tu vehículo.' });
+    }
+    if (!enteroPositivo(capacidadPuestos) || Number(capacidadPuestos) > 20) {
+      return res.status(400).json({ ok: false, mensaje: 'Ingresa una capacidad de puestos válida.' });
+    }
+    capacidadPuestos = Number(capacidadPuestos);
+
+    await pool.query(
+      'UPDATE usuarios SET nombre = ?, telefono = ?, vehiculo_modelo = ?, vehiculo_placa = ?, capacidad_puestos = ? WHERE id = ?',
+      [nombre, telefono, vehiculoModelo, vehiculoPlaca, capacidadPuestos, req.usuario.id]
+    );
+  } else {
+    await pool.query('UPDATE usuarios SET nombre = ?, telefono = ? WHERE id = ?', [nombre, telefono, req.usuario.id]);
+  }
+
+  const [filas] = await pool.query(
+    'SELECT id, nombre, telefono, email, rol, vehiculo_modelo, vehiculo_placa, capacidad_puestos FROM usuarios WHERE id = ? LIMIT 1',
+    [req.usuario.id]
+  );
+
+  res.json({ ok: true, mensaje: 'Perfil actualizado correctamente.', usuario: filas[0] });
+}));
+
+app.put('/api/auth/password', autenticar, manejadorAsincrono(async (req, res) => {
+  const cuerpo = req.body || {};
+  const passwordActual = String(cuerpo.password_actual || '');
+  const passwordNueva = String(cuerpo.password_nueva || '');
+
+  if (passwordNueva.length < 6) {
+    return res.status(400).json({ ok: false, mensaje: 'La contraseña nueva debe tener al menos 6 caracteres.' });
+  }
+
+  const [filas] = await pool.query('SELECT password FROM usuarios WHERE id = ? LIMIT 1', [req.usuario.id]);
+  const usuarioDb = filas[0];
+  if (!usuarioDb || !verificarPassword(passwordActual, usuarioDb.password)) {
+    return res.status(401).json({ ok: false, mensaje: 'Tu contraseña actual no es correcta.' });
+  }
+
+  const nuevoHash = hashearPassword(passwordNueva);
+  await pool.query('UPDATE usuarios SET password = ? WHERE id = ?', [nuevoHash, req.usuario.id]);
+
+  res.json({ ok: true, mensaje: 'Contraseña actualizada correctamente.' });
+}));
+
 // -----------------------------------------------------------------------------
 // 7. RUTAS API — VIAJES
 // -----------------------------------------------------------------------------
@@ -680,9 +749,95 @@ app.get('/api/viajes/mios', autenticar, requiereRol('conductor'), manejadorAsinc
   const sql =
     'SELECT v.*, ' +
     '  (SELECT COUNT(*) FROM reservas r WHERE r.viaje_id = v.id AND r.estado = "confirmada") AS reservas_confirmadas ' +
-    'FROM viajes v WHERE v.conductor_id = ? ORDER BY v.creado_en DESC';
+    "FROM viajes v WHERE v.conductor_id = ? AND v.estado = 'activo' " +
+    'ORDER BY v.fecha_salida ASC, v.hora_salida ASC';
   const [filas] = await pool.query(sql, [req.usuario.id]);
   res.json({ ok: true, viajes: filas });
+}));
+
+app.get('/api/viajes/historial', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
+  const sql =
+    'SELECT v.*, ' +
+    '  (SELECT COUNT(*) FROM reservas r WHERE r.viaje_id = v.id AND r.estado = "confirmada") AS reservas_confirmadas ' +
+    "FROM viajes v WHERE v.conductor_id = ? AND v.estado IN ('completado','cancelado') " +
+    'ORDER BY v.fecha_salida DESC, v.hora_salida DESC ' +
+    'LIMIT 200';
+  const [filas] = await pool.query(sql, [req.usuario.id]);
+  res.json({ ok: true, viajes: filas });
+}));
+
+app.put('/api/viajes/:id', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
+  const id = Number(req.params.id);
+  if (!enteroPositivo(id)) return res.status(400).json({ ok: false, mensaje: 'Viaje inválido.' });
+
+  const cuerpo = req.body || {};
+  const horaSalida = String(cuerpo.hora_salida || '').trim();
+  const precio = cuerpo.precio;
+  const puestosTotales = cuerpo.puestos_totales;
+
+  if (!REGEX_HORA.test(horaSalida)) {
+    return res.status(400).json({ ok: false, mensaje: 'Ingresa una hora de salida válida.' });
+  }
+  if (!numeroNoNegativo(precio)) {
+    return res.status(400).json({ ok: false, mensaje: 'Ingresa un precio válido.' });
+  }
+  if (!enteroPositivo(puestosTotales)) {
+    return res.status(400).json({ ok: false, mensaje: 'Ingresa una cantidad válida de puestos.' });
+  }
+
+  const conexion = await pool.getConnection();
+  try {
+    await conexion.beginTransaction();
+
+    const [filasViaje] = await conexion.query('SELECT * FROM viajes WHERE id = ? FOR UPDATE', [id]);
+    const viaje = filasViaje[0];
+    if (!viaje) {
+      await conexion.rollback();
+      return res.status(404).json({ ok: false, mensaje: 'Ese viaje no existe.' });
+    }
+    if (viaje.conductor_id !== req.usuario.id) {
+      await conexion.rollback();
+      return res.status(403).json({ ok: false, mensaje: 'No puedes editar un viaje que no publicaste.' });
+    }
+    if (viaje.estado !== 'activo') {
+      await conexion.rollback();
+      return res.status(400).json({ ok: false, mensaje: 'Solo puedes editar viajes que todavía están activos.' });
+    }
+
+    const puestosYaReservados = viaje.puestos_totales - viaje.puestos_disponibles;
+    if (Number(puestosTotales) < puestosYaReservados) {
+      await conexion.rollback();
+      return res.status(400).json({
+        ok: false,
+        mensaje: `Ya hay ${puestosYaReservados} puesto(s) reservado(s): no puedes bajar de esa cantidad.`,
+      });
+    }
+
+    const [filasConductor] = await conexion.query('SELECT capacidad_puestos FROM usuarios WHERE id = ? LIMIT 1', [req.usuario.id]);
+    const capacidadVehiculo = filasConductor[0] ? filasConductor[0].capacidad_puestos : null;
+    if (capacidadVehiculo && Number(puestosTotales) > Number(capacidadVehiculo)) {
+      await conexion.rollback();
+      return res.status(400).json({
+        ok: false,
+        mensaje: `No puedes ofrecer más puestos (${puestosTotales}) que la capacidad de tu vehículo (${capacidadVehiculo}).`,
+      });
+    }
+
+    const nuevosDisponibles = Number(puestosTotales) - puestosYaReservados;
+
+    await conexion.query(
+      'UPDATE viajes SET hora_salida = ?, precio = ?, puestos_totales = ?, puestos_disponibles = ? WHERE id = ?',
+      [horaSalida, Number(precio), Number(puestosTotales), nuevosDisponibles, id]
+    );
+
+    await conexion.commit();
+    res.json({ ok: true, mensaje: 'Viaje actualizado correctamente.' });
+  } catch (err) {
+    await conexion.rollback();
+    throw err;
+  } finally {
+    conexion.release();
+  }
 }));
 
 app.get('/api/viajes/:id/reservas', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
@@ -819,8 +974,23 @@ app.get('/api/reservas/mias', autenticar, requiereRol('pasajero'), manejadorAsin
     'FROM reservas r ' +
     'JOIN viajes v ON r.viaje_id = v.id ' +
     'JOIN usuarios u ON v.conductor_id = u.id ' +
-    'WHERE r.pasajero_id = ? ' +
-    'ORDER BY r.creado_en DESC';
+    "WHERE r.pasajero_id = ? AND r.estado = 'confirmada' AND v.estado = 'activo' " +
+    'ORDER BY v.fecha_salida ASC, v.hora_salida ASC';
+  const [filas] = await pool.query(sql, [req.usuario.id]);
+  res.json({ ok: true, reservas: filas });
+}));
+
+app.get('/api/reservas/historial', autenticar, requiereRol('pasajero'), manejadorAsincrono(async (req, res) => {
+  const sql =
+    'SELECT r.id, r.puestos_reservados, r.punto_recogida, r.estado, r.creado_en, ' +
+    '       v.id AS viaje_id, v.origen, v.destino, v.fecha_salida, v.hora_salida, v.precio, v.estado AS viaje_estado, ' +
+    '       u.nombre AS conductor_nombre, u.telefono AS conductor_telefono, u.vehiculo_modelo, u.vehiculo_placa ' +
+    'FROM reservas r ' +
+    'JOIN viajes v ON r.viaje_id = v.id ' +
+    'JOIN usuarios u ON v.conductor_id = u.id ' +
+    "WHERE r.pasajero_id = ? AND (r.estado = 'cancelada' OR v.estado IN ('completado','cancelado')) " +
+    'ORDER BY v.fecha_salida DESC, v.hora_salida DESC ' +
+    'LIMIT 200';
   const [filas] = await pool.query(sql, [req.usuario.id]);
   res.json({ ok: true, reservas: filas });
 }));
@@ -1176,11 +1346,17 @@ const PAGINA_HTML = `<!DOCTYPE html>
     busquedaHecha: false,
     misViajes: [],
     misViajesCargando: false,
+    historialViajes: [],
+    historialViajesCargando: false,
     detallePasajeros: {},
     viajeExpandido: {},
     misReservas: [],
     misReservasCargando: false,
+    historialReservas: [],
+    historialReservasCargando: false,
     modalViajeId: null,
+    modalPerfilAbierto: false,
+    modalEditarViajeId: null,
     enviando: false,
     notificacionesEstado: 'default',
     clavePublicaVapid: null
@@ -1475,6 +1651,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
     } else if (estado.vista === 'pasajero') {
       html += vistaPasajero();
     }
+    if (estado.modalPerfilAbierto) html += modalPerfil();
     raiz.innerHTML = html;
   }
 
@@ -1499,7 +1676,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
       partes.push('        <span class="text-sm font-semibold">' + escaparHTML(estado.usuario.nombre) + '</span>');
       partes.push('        <span class="text-xs text-white/60">' + (estado.usuario.rol === 'conductor' ? 'Conductor' : 'Pasajero') + '</span>');
       partes.push('      </div>');
-      partes.push('      <div class="w-9 h-9 rounded-full bg-travel-accent text-travel-primarydark flex items-center justify-center font-display font-bold text-sm">' + inicial + '</div>');
+      partes.push('      <button data-action="abrir-perfil" title="Mi perfil" class="w-9 h-9 rounded-full bg-travel-accent text-travel-primarydark flex items-center justify-center font-display font-bold text-sm">' + inicial + '</button>');
       partes.push('      <button data-action="cerrar-sesion" class="text-xs sm:text-sm font-semibold bg-white/10 hover:bg-white/20 transition rounded-lg px-3 py-2">Salir</button>');
       partes.push('    </div>');
     }
@@ -1624,12 +1801,19 @@ const PAGINA_HTML = `<!DOCTYPE html>
     p.push('  <div class="flex border-b border-travel-line mb-6">');
     p.push('    <button data-action="tab-conductor-publicar" class="px-4 py-3 text-sm font-semibold ' + (estado.conductorTab === 'publicar' ? 'pestana-activa' : 'pestana-inactiva') + '">Publicar viaje</button>');
     p.push('    <button data-action="tab-conductor-mis-viajes" class="px-4 py-3 text-sm font-semibold ' + (estado.conductorTab === 'mis-viajes' ? 'pestana-activa' : 'pestana-inactiva') + '">Mis viajes</button>');
+    p.push('    <button data-action="tab-conductor-historial" class="px-4 py-3 text-sm font-semibold ' + (estado.conductorTab === 'historial' ? 'pestana-activa' : 'pestana-inactiva') + '">Historial</button>');
     p.push('  </div>');
 
     if (estado.conductorTab === 'publicar') {
       p.push(formularioPublicarViaje());
-    } else {
+    } else if (estado.conductorTab === 'mis-viajes') {
       p.push(listaMisViajes());
+    } else {
+      p.push(listaHistorialViajes());
+    }
+
+    if (estado.modalEditarViajeId) {
+      p.push(modalEditarViaje());
     }
 
     p.push('</div>');
@@ -1719,9 +1903,10 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('    </div>');
       p.push('  </div>');
 
-      p.push('  <div class="flex items-center gap-2 mt-4">');
+      p.push('  <div class="flex items-center gap-2 mt-4 flex-wrap">');
       p.push('    <button data-action="ver-pasajeros" data-id="' + v.id + '" class="text-xs font-semibold text-travel-primary bg-travel-primary/5 hover:bg-travel-primary/10 transition rounded-lg px-3 py-2">' + (expandido ? 'Ocultar pasajeros' : 'Ver pasajeros (' + (v.reservas_confirmadas || 0) + ')') + '</button>');
       if (v.estado === 'activo') {
+        p.push('    <button data-action="editar-viaje" data-id="' + v.id + '" class="text-xs font-semibold text-travel-ink bg-travel-ink/5 hover:bg-travel-ink/10 transition rounded-lg px-3 py-2">Editar</button>');
         p.push('    <button data-action="cancelar-viaje" data-id="' + v.id + '" class="text-xs font-semibold text-travel-danger bg-travel-danger/5 hover:bg-travel-danger/10 transition rounded-lg px-3 py-2">Cancelar viaje</button>');
       }
       p.push('  </div>');
@@ -1734,6 +1919,90 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
       p.push('</div>');
     }
+    p.push('</div>');
+    return p.join('');
+  }
+
+  function listaHistorialViajes() {
+    var p = [];
+    if (estado.historialViajesCargando) {
+      p.push('<div class="text-center text-travel-muted py-16">Cargando tu historial…</div>');
+      return p.join('');
+    }
+    if (!estado.historialViajes.length) {
+      p.push('<div class="text-center py-16"><p class="text-travel-muted">Todavía no tienes viajes completados o cancelados.</p></div>');
+      return p.join('');
+    }
+
+    p.push('<div class="flex flex-col gap-4">');
+    for (var i = 0; i < estado.historialViajes.length; i++) {
+      var v = estado.historialViajes[i];
+      var expandido = !!estado.viajeExpandido[v.id];
+      var estadoBadge = v.estado === 'cancelado'
+        ? '<span class="text-xs font-semibold px-2 py-1 rounded-full bg-travel-danger/10 text-travel-danger">Cancelado</span>'
+        : '<span class="text-xs font-semibold px-2 py-1 rounded-full bg-travel-muted/10 text-travel-muted">Completado</span>';
+
+      p.push('<div class="bg-white rounded-2xl shadow-card p-5 opacity-90">');
+      p.push('  <div class="flex items-start justify-between gap-3">');
+      p.push('    <div class="flex-1">');
+      p.push('      <div class="flex items-center gap-2 flex-wrap">');
+      p.push('        <span class="font-display font-bold text-travel-ink">' + escaparHTML(v.origen) + ' → ' + escaparHTML(v.destino) + '</span>');
+      p.push('        ' + estadoBadge);
+      p.push('      </div>');
+      p.push('      <p class="text-sm text-travel-muted mt-1">' + formatearFecha(v.fecha_salida) + ' · ' + formatearHora(v.hora_salida) + ' · ' + formatearPrecio(v.precio) + ' por puesto</p>');
+      p.push('    </div>');
+      p.push('  </div>');
+      p.push('  <div class="flex items-center gap-2 mt-4">');
+      p.push('    <button data-action="ver-pasajeros" data-id="' + v.id + '" class="text-xs font-semibold text-travel-primary bg-travel-primary/5 hover:bg-travel-primary/10 transition rounded-lg px-3 py-2">' + (expandido ? 'Ocultar pasajeros' : 'Ver pasajeros (' + (v.reservas_confirmadas || 0) + ')') + '</button>');
+      p.push('  </div>');
+      if (expandido) {
+        p.push('  <div class="mt-4 border-t border-travel-line pt-4">');
+        p.push(detallePasajerosHTML(v.id));
+        p.push('  </div>');
+      }
+      p.push('</div>');
+    }
+    p.push('</div>');
+    return p.join('');
+  }
+
+  function modalEditarViaje() {
+    var viaje = null;
+    for (var i = 0; i < estado.misViajes.length; i++) {
+      if (estado.misViajes[i].id === estado.modalEditarViajeId) { viaje = estado.misViajes[i]; break; }
+    }
+    if (!viaje) return '';
+
+    var p = [];
+    p.push('<div class="fixed inset-0 z-40 flex items-end sm:items-center justify-center bg-travel-ink/50 px-0 sm:px-4">');
+    p.push('  <div class="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-card p-6 anim-entrada">');
+    p.push('    <div class="flex items-center justify-between mb-4">');
+    p.push('      <h3 class="fuente-display text-lg font-bold text-travel-ink">Editar viaje</h3>');
+    p.push('      <button data-action="cerrar-modal-editar-viaje" class="text-travel-muted hover:text-travel-ink text-xl leading-none">&times;</button>');
+    p.push('    </div>');
+    p.push('    <p class="text-sm text-travel-muted mb-4">' + escaparHTML(viaje.origen) + ' → ' + escaparHTML(viaje.destino) + ' · ' + formatearFecha(viaje.fecha_salida) + '</p>');
+    p.push('    <form id="form-editar-viaje" class="flex flex-col gap-4">');
+    p.push('      <input type="hidden" name="viaje_id" value="' + viaje.id + '">');
+    p.push('      <div>');
+    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Hora de salida</label>');
+    p.push('        <input type="time" name="hora_salida" required value="' + formatearHora(viaje.hora_salida) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('      </div>');
+    p.push('      <div class="grid grid-cols-2 gap-3">');
+    p.push('        <div>');
+    p.push('          <label class="block text-sm font-medium text-travel-ink mb-1">Puestos totales</label>');
+    p.push('          <input type="number" name="puestos_totales" required min="1" max="20" value="' + viaje.puestos_totales + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('        </div>');
+    p.push('        <div>');
+    p.push('          <label class="block text-sm font-medium text-travel-ink mb-1">Precio por puesto</label>');
+    p.push('          <input type="number" name="precio" required min="0" step="1000" value="' + viaje.precio + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('        </div>');
+    p.push('      </div>');
+    if (viaje.puestos_totales - viaje.puestos_disponibles > 0) {
+      p.push('      <p class="text-xs text-travel-muted">Ya hay ' + (viaje.puestos_totales - viaje.puestos_disponibles) + ' puesto(s) reservado(s): no puedes bajar de esa cantidad.</p>');
+    }
+    p.push('      <button type="submit" class="bg-travel-primary hover:bg-travel-primarydark transition text-white font-semibold rounded-xl py-3 text-sm">Guardar cambios</button>');
+    p.push('    </form>');
+    p.push('  </div>');
     p.push('</div>');
     return p.join('');
   }
@@ -1775,6 +2044,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
     p.push('  <div class="flex border-b border-travel-line mb-6">');
     p.push('    <button data-action="tab-pasajero-buscar" class="px-4 py-3 text-sm font-semibold ' + (estado.pasajeroTab === 'buscar' ? 'pestana-activa' : 'pestana-inactiva') + '">Buscar viaje</button>');
     p.push('    <button data-action="tab-pasajero-mis-reservas" class="px-4 py-3 text-sm font-semibold ' + (estado.pasajeroTab === 'mis-reservas' ? 'pestana-activa' : 'pestana-inactiva') + '">Mis reservas</button>');
+    p.push('    <button data-action="tab-pasajero-historial" class="px-4 py-3 text-sm font-semibold ' + (estado.pasajeroTab === 'historial' ? 'pestana-activa' : 'pestana-inactiva') + '">Historial</button>');
     p.push('  </div>');
 
     if (estado.pasajeroTab === 'buscar') {
@@ -1782,8 +2052,10 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('<div class="mt-6">');
       p.push(listaResultadosBusqueda());
       p.push('</div>');
-    } else {
+    } else if (estado.pasajeroTab === 'mis-reservas') {
       p.push(listaMisReservas());
+    } else {
+      p.push(listaHistorialReservas());
     }
 
     if (estado.modalViajeId) {
@@ -1898,6 +2170,65 @@ const PAGINA_HTML = `<!DOCTYPE html>
     return p.join('');
   }
 
+  function modalPerfil() {
+    if (!estado.usuario) return '';
+    var u = estado.usuario;
+    var esConductor = u.rol === 'conductor';
+    var p = [];
+    p.push('<div class="fixed inset-0 z-40 flex items-start sm:items-center justify-center bg-travel-ink/50 px-0 sm:px-4 overflow-y-auto py-6">');
+    p.push('  <div class="bg-white w-full sm:max-w-md rounded-t-3xl sm:rounded-2xl shadow-card p-6 anim-entrada">');
+    p.push('    <div class="flex items-center justify-between mb-4">');
+    p.push('      <h3 class="fuente-display text-lg font-bold text-travel-ink">Mi perfil</h3>');
+    p.push('      <button data-action="cerrar-modal-perfil" class="text-travel-muted hover:text-travel-ink text-xl leading-none">&times;</button>');
+    p.push('    </div>');
+
+    p.push('    <form id="form-editar-perfil" class="flex flex-col gap-4">');
+    p.push('      <div>');
+    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Nombre completo</label>');
+    p.push('        <input type="text" name="nombre" required minlength="2" maxlength="150" value="' + escaparHTML(u.nombre) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('      </div>');
+    p.push('      <div>');
+    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Teléfono</label>');
+    p.push('        <input type="tel" name="telefono" required minlength="6" maxlength="30" value="' + escaparHTML(u.telefono) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('      </div>');
+    p.push('      <div>');
+    p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Correo</label>');
+    p.push('        <input type="email" disabled value="' + escaparHTML(u.email) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm bg-travel-bg text-travel-muted">');
+    p.push('      </div>');
+    if (esConductor) {
+      p.push('      <div class="h-px bg-travel-line my-1"></div>');
+      p.push('      <p class="text-xs font-semibold text-travel-muted uppercase tracking-wide">Datos de tu vehículo</p>');
+      p.push('      <div>');
+      p.push('        <label class="block text-sm font-medium text-travel-ink mb-1">Modelo del vehículo</label>');
+      p.push('        <input type="text" name="vehiculo_modelo" required maxlength="100" value="' + escaparHTML(u.vehiculo_modelo) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+      p.push('      </div>');
+      p.push('      <div class="grid grid-cols-2 gap-3">');
+      p.push('        <div>');
+      p.push('          <label class="block text-sm font-medium text-travel-ink mb-1">Placa</label>');
+      p.push('          <input type="text" name="vehiculo_placa" required maxlength="20" value="' + escaparHTML(u.vehiculo_placa) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm uppercase">');
+      p.push('        </div>');
+      p.push('        <div>');
+      p.push('          <label class="block text-sm font-medium text-travel-ink mb-1">Capacidad</label>');
+      p.push('          <input type="number" name="capacidad_puestos" required min="1" max="20" value="' + escaparHTML(u.capacidad_puestos) + '" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+      p.push('        </div>');
+      p.push('      </div>');
+    }
+    p.push('      <button type="submit" class="bg-travel-primary hover:bg-travel-primarydark transition text-white font-semibold rounded-xl py-3 text-sm">Guardar cambios</button>');
+    p.push('    </form>');
+
+    p.push('    <div class="h-px bg-travel-line my-5"></div>');
+    p.push('    <p class="text-xs font-semibold text-travel-muted uppercase tracking-wide mb-3">Cambiar contraseña</p>');
+    p.push('    <form id="form-cambiar-password" class="flex flex-col gap-3">');
+    p.push('      <input type="password" name="password_actual" required placeholder="Contraseña actual" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('      <input type="password" name="password_nueva" required minlength="6" placeholder="Contraseña nueva (mínimo 6 caracteres)" class="w-full rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
+    p.push('      <button type="submit" class="bg-travel-ink hover:bg-travel-primarydark transition text-white font-semibold rounded-xl py-3 text-sm">Cambiar contraseña</button>');
+    p.push('    </form>');
+
+    p.push('  </div>');
+    p.push('</div>');
+    return p.join('');
+  }
+
   function listaMisReservas() {
     var p = [];
     if (estado.misReservasCargando) {
@@ -1932,6 +2263,40 @@ const PAGINA_HTML = `<!DOCTYPE html>
         p.push('    <button data-action="cancelar-reserva" data-id="' + r.id + '" data-total="' + r.puestos_reservados + '" class="text-xs font-semibold text-travel-danger bg-travel-danger/5 hover:bg-travel-danger/10 transition rounded-lg px-3 py-2">Cancelar reserva</button>');
         p.push('  </div>');
       }
+      p.push('</div>');
+    }
+    p.push('</div>');
+    return p.join('');
+  }
+
+  function listaHistorialReservas() {
+    var p = [];
+    if (estado.historialReservasCargando) {
+      p.push('<div class="text-center text-travel-muted py-16">Cargando tu historial…</div>');
+      return p.join('');
+    }
+    if (!estado.historialReservas.length) {
+      p.push('<div class="text-center py-16"><p class="text-travel-muted">Todavía no tienes viajes en tu historial.</p></div>');
+      return p.join('');
+    }
+
+    p.push('<div class="flex flex-col gap-4">');
+    for (var i = 0; i < estado.historialReservas.length; i++) {
+      var r = estado.historialReservas[i];
+      var estadoTexto, estadoClase;
+      if (r.estado === 'cancelada') { estadoTexto = 'Cancelada'; estadoClase = 'bg-travel-danger/10 text-travel-danger'; }
+      else if (r.viaje_estado === 'cancelado') { estadoTexto = 'Viaje cancelado'; estadoClase = 'bg-travel-danger/10 text-travel-danger'; }
+      else { estadoTexto = 'Completado'; estadoClase = 'bg-travel-muted/10 text-travel-muted'; }
+
+      p.push('<div class="bg-white rounded-2xl shadow-card p-5 opacity-90">');
+      p.push('  <div class="flex items-start justify-between gap-3">');
+      p.push('    <div>');
+      p.push('      <p class="font-display font-bold text-travel-ink">' + escaparHTML(r.origen) + ' → ' + escaparHTML(r.destino) + '</p>');
+      p.push('      <p class="text-sm text-travel-muted mt-1">' + formatearFecha(r.fecha_salida) + ' · ' + formatearHora(r.hora_salida) + ' · ' + r.puestos_reservados + ' puesto(s)</p>');
+      p.push('      <p class="text-sm text-travel-muted">Conductor: ' + escaparHTML(r.conductor_nombre) + '</p>');
+      p.push('    </div>');
+      p.push('    <span class="text-xs font-semibold px-2 py-1 rounded-full whitespace-nowrap ' + estadoClase + '">' + estadoTexto + '</span>');
+      p.push('  </div>');
       p.push('</div>');
     }
     p.push('</div>');
@@ -1980,6 +2345,22 @@ const PAGINA_HTML = `<!DOCTYPE html>
     });
   }
 
+  function cargarHistorialViajes(mostrarCargando) {
+    if (mostrarCargando !== false) {
+      estado.historialViajesCargando = true;
+      render();
+    }
+    api('/viajes/historial', { method: 'GET' }).then(function (datos) {
+      estado.historialViajes = datos.viajes;
+      estado.historialViajesCargando = false;
+      render();
+    }).catch(function (err) {
+      estado.historialViajesCargando = false;
+      render();
+      mostrarToast(err.message, 'error');
+    });
+  }
+
   function cargarMisReservas(mostrarCargando) {
     if (mostrarCargando !== false) {
       estado.misReservasCargando = true;
@@ -1991,6 +2372,22 @@ const PAGINA_HTML = `<!DOCTYPE html>
       render();
     }).catch(function (err) {
       estado.misReservasCargando = false;
+      render();
+      mostrarToast(err.message, 'error');
+    });
+  }
+
+  function cargarHistorialReservas(mostrarCargando) {
+    if (mostrarCargando !== false) {
+      estado.historialReservasCargando = true;
+      render();
+    }
+    api('/reservas/historial', { method: 'GET' }).then(function (datos) {
+      estado.historialReservas = datos.reservas;
+      estado.historialReservasCargando = false;
+      render();
+    }).catch(function (err) {
+      estado.historialReservasCargando = false;
       render();
       mostrarToast(err.message, 'error');
     });
@@ -2019,6 +2416,11 @@ const PAGINA_HTML = `<!DOCTYPE html>
     }).catch(function (err) {
       mostrarToast(err.message, 'error');
     });
+  }
+
+  function abrirModalEditarViaje(viajeId) {
+    estado.modalEditarViajeId = Number(viajeId);
+    render();
   }
 
   function pedirCantidadACancelar(totalPuestos) {
@@ -2183,6 +2585,52 @@ const PAGINA_HTML = `<!DOCTYPE html>
     });
   }
 
+  function manejarEditarPerfil(formulario) {
+    if (estado.enviando) return;
+    var datos = datosFormulario(formulario);
+    estado.enviando = true;
+    api('/auth/perfil', { method: 'PUT', cuerpo: datos }).then(function (respuesta) {
+      estado.enviando = false;
+      estado.usuario = respuesta.usuario;
+      localStorage.setItem('traveling_usuario', JSON.stringify(respuesta.usuario));
+      mostrarToast(respuesta.mensaje, 'exito');
+      render();
+    }).catch(function (err) {
+      estado.enviando = false;
+      mostrarToast(err.message, 'error');
+    });
+  }
+
+  function manejarCambiarPassword(formulario) {
+    if (estado.enviando) return;
+    var datos = datosFormulario(formulario);
+    estado.enviando = true;
+    api('/auth/password', { method: 'PUT', cuerpo: datos }).then(function (respuesta) {
+      estado.enviando = false;
+      mostrarToast(respuesta.mensaje, 'exito');
+      formulario.reset();
+    }).catch(function (err) {
+      estado.enviando = false;
+      mostrarToast(err.message, 'error');
+    });
+  }
+
+  function manejarEditarViaje(formulario) {
+    if (estado.enviando) return;
+    var datos = datosFormulario(formulario);
+    var viajeId = datos.viaje_id;
+    estado.enviando = true;
+    api('/viajes/' + viajeId, { method: 'PUT', cuerpo: datos }).then(function (respuesta) {
+      estado.enviando = false;
+      mostrarToast(respuesta.mensaje, 'exito');
+      estado.modalEditarViajeId = null;
+      cargarMisViajes(false);
+    }).catch(function (err) {
+      estado.enviando = false;
+      mostrarToast(err.message, 'error');
+    });
+  }
+
   function manejarBusqueda(formulario) {
     var datos = datosFormulario(formulario);
     cargarBusqueda(datos);
@@ -2220,6 +2668,9 @@ const PAGINA_HTML = `<!DOCTYPE html>
     else if (formulario.id === 'form-publicar-viaje') { e.preventDefault(); manejarPublicarViaje(formulario); }
     else if (formulario.id === 'form-busqueda') { e.preventDefault(); manejarBusqueda(formulario); }
     else if (formulario.id === 'form-reservar') { e.preventDefault(); manejarReservar(formulario); }
+    else if (formulario.id === 'form-editar-perfil') { e.preventDefault(); manejarEditarPerfil(formulario); }
+    else if (formulario.id === 'form-cambiar-password') { e.preventDefault(); manejarCambiarPassword(formulario); }
+    else if (formulario.id === 'form-editar-viaje') { e.preventDefault(); manejarEditarViaje(formulario); }
   });
 
   document.addEventListener('click', function (e) {
@@ -2233,10 +2684,14 @@ const PAGINA_HTML = `<!DOCTYPE html>
     else if (accion === 'cerrar-sesion') { cerrarSesion(); }
     else if (accion === 'tab-conductor-publicar') { estado.conductorTab = 'publicar'; render(); }
     else if (accion === 'tab-conductor-mis-viajes') { estado.conductorTab = 'mis-viajes'; cargarMisViajes(); }
+    else if (accion === 'tab-conductor-historial') { estado.conductorTab = 'historial'; cargarHistorialViajes(); }
     else if (accion === 'tab-pasajero-buscar') { estado.pasajeroTab = 'buscar'; render(); }
     else if (accion === 'tab-pasajero-mis-reservas') { estado.pasajeroTab = 'mis-reservas'; cargarMisReservas(); }
+    else if (accion === 'tab-pasajero-historial') { estado.pasajeroTab = 'historial'; cargarHistorialReservas(); }
     else if (accion === 'ver-pasajeros') { alternarDetallePasajeros(id); }
     else if (accion === 'cancelar-viaje') { confirmarCancelarViaje(id); }
+    else if (accion === 'editar-viaje') { abrirModalEditarViaje(id); }
+    else if (accion === 'cerrar-modal-editar-viaje') { estado.modalEditarViajeId = null; render(); }
     else if (accion === 'abrir-modal-reserva') { abrirModalReserva(id); }
     else if (accion === 'cerrar-modal') { estado.modalViajeId = null; render(); }
     else if (accion === 'cancelar-reserva') { confirmarCancelarReserva(id, Number(el.getAttribute('data-total')) || 1); }
@@ -2244,6 +2699,8 @@ const PAGINA_HTML = `<!DOCTYPE html>
     else if (accion === 'activar-notificaciones') { activarNotificaciones(); }
     else if (accion === 'avisar-cupo') { pedirAvisoCupo(id); }
     else if (accion === 'quitar-aviso-cupo') { quitarAvisoCupo(id); }
+    else if (accion === 'abrir-perfil') { estado.modalPerfilAbierto = true; render(); }
+    else if (accion === 'cerrar-modal-perfil') { estado.modalPerfilAbierto = false; render(); }
   });
 
   document.addEventListener('change', function (e) {
@@ -2327,9 +2784,29 @@ app.use((err, req, res, next) => {
   res.status(500).json({ ok: false, mensaje: 'Ocurrió un error interno. Intenta de nuevo en unos segundos.' });
 });
 
+/**
+ * Pasa a "completado" cualquier viaje activo cuya fecha y hora ya pasaron.
+ * Se corre al iniciar y luego cada 15 minutos: así "Mis viajes" /
+ * "Historial" siempre reflejan la realidad sin depender de un cron externo.
+ */
+async function marcarViajesCompletados() {
+  try {
+    const [resultado] = await pool.query(
+      "UPDATE viajes SET estado = 'completado' WHERE estado = 'activo' AND TIMESTAMP(fecha_salida, hora_salida) < NOW()"
+    );
+    if (resultado.affectedRows > 0) {
+      console.log(`[Traveling] ${resultado.affectedRows} viaje(s) pasaron a "completado".`);
+    }
+  } catch (err) {
+    console.error('[Traveling] Error marcando viajes completados:', err.message);
+  }
+}
+
 async function iniciar() {
   try {
     await inicializarBaseDeDatos();
+    await marcarViajesCompletados();
+    setInterval(marcarViajesCompletados, 15 * 60 * 1000);
     app.listen(PUERTO, () => {
       console.log(`[Traveling] Servidor escuchando en http://localhost:${PUERTO}`);
     });
