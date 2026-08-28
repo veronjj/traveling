@@ -765,7 +765,7 @@ app.get('/api/viajes', autenticarOpcional, manejadorAsincrono(async (req, res) =
 app.get('/api/viajes/mios', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
   const sql =
     'SELECT v.*, ' +
-    '  (SELECT COUNT(*) FROM reservas r WHERE r.viaje_id = v.id AND r.estado = "confirmada") AS reservas_confirmadas ' +
+    '  (SELECT COALESCE(SUM(r.puestos_reservados),0) FROM reservas r WHERE r.viaje_id = v.id AND r.estado = "confirmada") AS reservas_confirmadas ' +
     "FROM viajes v WHERE v.conductor_id = ? AND v.estado = 'activo' " +
     'ORDER BY v.fecha_salida ASC, v.hora_salida ASC';
   const [filas] = await pool.query(sql, [req.usuario.id]);
@@ -775,7 +775,7 @@ app.get('/api/viajes/mios', autenticar, requiereRol('conductor'), manejadorAsinc
 app.get('/api/viajes/historial', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
   const sql =
     'SELECT v.*, ' +
-    '  (SELECT COUNT(*) FROM reservas r WHERE r.viaje_id = v.id AND r.estado = "confirmada") AS reservas_confirmadas ' +
+    '  (SELECT COALESCE(SUM(r.puestos_reservados),0) FROM reservas r WHERE r.viaje_id = v.id AND r.estado = "confirmada") AS reservas_confirmadas ' +
     "FROM viajes v WHERE v.conductor_id = ? AND v.estado IN ('completado','cancelado') " +
     'ORDER BY v.fecha_salida DESC, v.hora_salida DESC ' +
     'LIMIT 200';
@@ -910,13 +910,87 @@ app.get('/api/viajes/:id/reservas', autenticar, requiereRol('conductor'), maneja
   }
 
   const sql =
-    'SELECT r.id, r.puestos_reservados, r.punto_recogida, r.estado, r.creado_en, ' +
-    '       u.nombre AS pasajero_nombre, u.telefono AS pasajero_telefono ' +
+    'SELECT r.pasajero_id, u.nombre AS pasajero_nombre, u.telefono AS pasajero_telefono, ' +
+    '       SUM(r.puestos_reservados) AS puestos_totales, ' +
+    "       GROUP_CONCAT(r.punto_recogida SEPARATOR ' · ') AS puntos_recogida, " +
+    '       COUNT(*) AS num_reservas, MIN(r.creado_en) AS creado_en ' +
     'FROM reservas r JOIN usuarios u ON r.pasajero_id = u.id ' +
-    'WHERE r.viaje_id = ? AND r.estado = "confirmada" ' +
-    'ORDER BY r.creado_en ASC';
+    "WHERE r.viaje_id = ? AND r.estado = 'confirmada' " +
+    'GROUP BY r.pasajero_id, u.nombre, u.telefono ' +
+    'ORDER BY MIN(r.creado_en) ASC';
   const [filas] = await pool.query(sql, [id]);
   res.json({ ok: true, reservas: filas });
+}));
+
+app.patch('/api/viajes/:id/pasajeros/:pasajeroId/cancelar', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
+  const viajeId = Number(req.params.id);
+  const pasajeroId = Number(req.params.pasajeroId);
+  if (!enteroPositivo(viajeId) || !enteroPositivo(pasajeroId)) {
+    return res.status(400).json({ ok: false, mensaje: 'Datos inválidos.' });
+  }
+
+  const conexion = await pool.getConnection();
+  try {
+    await conexion.beginTransaction();
+
+    const [filasViaje] = await conexion.query('SELECT * FROM viajes WHERE id = ? FOR UPDATE', [viajeId]);
+    const viaje = filasViaje[0];
+    if (!viaje) {
+      await conexion.rollback();
+      return res.status(404).json({ ok: false, mensaje: 'Ese viaje no existe.' });
+    }
+    if (viaje.conductor_id !== req.usuario.id) {
+      await conexion.rollback();
+      return res.status(403).json({ ok: false, mensaje: 'Ese viaje no es tuyo.' });
+    }
+
+    const [reservasPasajero] = await conexion.query(
+      "SELECT * FROM reservas WHERE viaje_id = ? AND pasajero_id = ? AND estado = 'confirmada' FOR UPDATE",
+      [viajeId, pasajeroId]
+    );
+    if (reservasPasajero.length === 0) {
+      await conexion.rollback();
+      return res.status(404).json({ ok: false, mensaje: 'Ese pasajero no tiene una reserva activa en este viaje.' });
+    }
+    const totalPuestos = reservasPasajero.reduce((acumulado, r) => acumulado + r.puestos_reservados, 0);
+
+    await conexion.query(
+      "UPDATE reservas SET estado = 'cancelada' WHERE viaje_id = ? AND pasajero_id = ? AND estado = 'confirmada'",
+      [viajeId, pasajeroId]
+    );
+
+    let seLiberoCupo = false;
+    if (viaje.estado === 'activo') {
+      const restaurados = Math.min(viaje.puestos_totales, viaje.puestos_disponibles + totalPuestos);
+      await conexion.query('UPDATE viajes SET puestos_disponibles = ? WHERE id = ?', [restaurados, viaje.id]);
+      seLiberoCupo = restaurados > 0;
+    }
+
+    await conexion.commit();
+    res.json({ ok: true, mensaje: `Se canceló la reserva de ese pasajero (${totalPuestos} puesto(s) en total).` });
+
+    enviarNotificacionAUsuario(pasajeroId, {
+      titulo: 'Tu reserva fue cancelada',
+      cuerpo: `El conductor canceló tu reserva en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
+      url: '/',
+    });
+
+    if (seLiberoCupo) {
+      const [interesados] = await pool.query('SELECT pasajero_id FROM avisos_cupo WHERE viaje_id = ?', [viaje.id]);
+      for (const interesado of interesados) {
+        enviarNotificacionAUsuario(interesado.pasajero_id, {
+          titulo: '¡Hay cupo disponible!',
+          cuerpo: `Se liberó un puesto en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
+          url: '/',
+        });
+      }
+    }
+  } catch (err) {
+    await conexion.rollback();
+    throw err;
+  } finally {
+    conexion.release();
+  }
 }));
 
 app.patch('/api/viajes/:id/cancelar', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
@@ -1491,6 +1565,13 @@ const PAGINA_HTML = `<!DOCTYPE html>
   .chip-primary:hover { background-color: rgba(255,255,255,0.14); }
   .chip-success { color: #6FE3AC; background-color: rgba(63,207,142,0.14); }
   .chip-success:hover { background-color: rgba(63,207,142,0.22); }
+
+  @keyframes chip-parpadeo {
+    0%, 100% { background-color: rgba(212,175,94,0.25); box-shadow: 0 0 0 0 rgba(212,175,94,0.45); }
+    50% { background-color: rgba(212,175,94,0.6); box-shadow: 0 0 0 5px rgba(212,175,94,0); }
+  }
+  .chip-alerta { color: #FFF3D6; background-color: rgba(212,175,94,0.3); animation: chip-parpadeo 1.6s ease-in-out infinite; }
+  .chip-alerta:hover { animation-play-state: paused; background-color: rgba(212,175,94,0.5); }
 
   .insignia {
     display: inline-flex;
@@ -2118,7 +2199,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
         p.push('  </div>');
 
         p.push('  <div class="flex items-center gap-2 mt-4 flex-wrap">');
-        p.push('    <button data-action="ver-pasajeros" data-id="' + v.id + '" class="chip chip-primary">' + (expandido ? 'Ocultar pasajeros' : 'Ver pasajeros (' + (v.reservas_confirmadas || 0) + ')') + '</button>');
+        p.push('    <button data-action="ver-pasajeros" data-id="' + v.id + '" class="chip ' + (!expandido && v.reservas_confirmadas > 0 ? 'chip-alerta' : 'chip-primary') + '">' + (expandido ? 'Ocultar pasajeros' : 'Ver pasajeros (' + (v.reservas_confirmadas || 0) + ')') + '</button>');
         if (v.estado === 'activo') {
           p.push('    <button data-action="finalizar-viaje" data-id="' + v.id + '" class="chip chip-success">✓ Finalizar viaje</button>');
           p.push('    <button data-action="editar-viaje" data-id="' + v.id + '" class="chip chip-primary">Editar</button>');
@@ -2246,14 +2327,15 @@ const PAGINA_HTML = `<!DOCTYPE html>
     p.push('<div class="flex flex-col gap-3">');
     for (var i = 0; i < lista.length; i++) {
       var r = lista[i];
+      var notaReservas = r.num_reservas > 1 ? ' (' + r.num_reservas + ' reservas)' : '';
       p.push('<div class="flex items-start justify-between gap-3 bg-travel-bg rounded-xl p-3">');
       p.push('  <div>');
-      p.push('    <p class="text-sm font-semibold text-travel-ink">' + escaparHTML(r.pasajero_nombre) + ' · ' + r.puestos_reservados + ' puesto(s)</p>');
-      p.push('    <p class="text-xs text-travel-muted mt-0.5">Recogida: ' + escaparHTML(r.punto_recogida) + '</p>');
+      p.push('    <p class="text-sm font-semibold text-travel-ink">' + escaparHTML(r.pasajero_nombre) + ' · ' + r.puestos_totales + ' puesto(s)' + notaReservas + '</p>');
+      p.push('    <p class="text-xs text-travel-muted mt-0.5">Recogida: ' + escaparHTML(r.puntos_recogida) + '</p>');
       p.push('  </div>');
       p.push('  <div class="text-right shrink-0 flex flex-col items-end gap-1.5">');
       p.push('    <a href="tel:' + escaparHTML(r.pasajero_telefono) + '" class="text-xs font-semibold text-travel-accent whitespace-nowrap">' + escaparHTML(r.pasajero_telefono) + '</a>');
-      p.push('    <button data-action="cancelar-reserva-conductor" data-id="' + r.id + '" data-total="' + r.puestos_reservados + '" class="chip chip-danger">Cancelar</button>');
+      p.push('    <button data-action="cancelar-reserva-conductor" data-viaje="' + viajeId + '" data-pasajero="' + r.pasajero_id + '" class="chip chip-danger">Cancelar</button>');
       p.push('  </div>');
       p.push('</div>');
     }
@@ -2340,7 +2422,12 @@ const PAGINA_HTML = `<!DOCTYPE html>
         p.push('      <p class="font-display font-bold text-travel-ink">' + escaparHTML(v.origen) + ' → ' + escaparHTML(v.destino) + '</p>');
         p.push('      <p class="text-sm text-travel-muted mt-1">' + formatearFecha(v.fecha_salida) + ' · ' + formatearHora(v.hora_salida) + '</p>');
         p.push('    </div>');
-        p.push('    <p class="font-display font-bold text-travel-accent text-lg shrink-0">' + formatearPrecio(v.precio) + '</p>');
+        p.push('    <div class="text-right shrink-0">');
+        p.push('      <p class="font-display font-bold text-travel-accent text-lg">' + formatearPrecio(v.precio) + '</p>');
+        if (!v.pico_y_placa) {
+          p.push('      <p class="text-xs text-travel-muted mt-0.5">' + v.puestos_disponibles + ' puesto(s) libre(s)</p>');
+        }
+        p.push('    </div>');
         p.push('  </div>');
 
         p.push('  <div class="flex items-center justify-between gap-3 border-t border-travel-line pt-4">');
@@ -2355,7 +2442,6 @@ const PAGINA_HTML = `<!DOCTYPE html>
           p.push('    <span class="text-xs font-bold px-3 py-2 rounded-full bg-travel-danger/10 text-travel-danger whitespace-nowrap">EN PICO Y PLACA</span>');
         } else if (v.puestos_disponibles > 0) {
           p.push('    <div class="text-right">');
-          p.push('      <p class="text-xs text-travel-muted mb-1">' + v.puestos_disponibles + ' puesto(s) libres</p>');
           p.push('      <button data-action="abrir-modal-reserva" data-id="' + v.id + '" class="btn btn-sm btn-accent">Reservar</button>');
           p.push('    </div>');
         } else {
@@ -2738,30 +2824,14 @@ const PAGINA_HTML = `<!DOCTYPE html>
     });
   }
 
-  function encontrarViajeDeReserva(reservaId) {
-    for (var viajeId in estado.detallePasajeros) {
-      if (!Object.prototype.hasOwnProperty.call(estado.detallePasajeros, viajeId)) continue;
-      var lista = estado.detallePasajeros[viajeId] || [];
-      for (var i = 0; i < lista.length; i++) {
-        if (lista[i].id === Number(reservaId)) return viajeId;
-      }
-    }
-    return null;
-  }
-
-  function confirmarCancelarReservaConductor(reservaId, totalPuestos) {
-    var cantidad = pedirCantidadACancelar(totalPuestos);
-    if (cantidad === null) return;
-    if (!window.confirm('¿Cancelar ' + cantidad + ' de ' + totalPuestos + ' puesto(s) de este pasajero? Se le notificará.')) return;
-    var viajeIdAfectado = encontrarViajeDeReserva(reservaId);
-    api('/reservas/' + reservaId + '/cancelar-conductor', { method: 'PATCH', cuerpo: { puestos_a_cancelar: cantidad } }).then(function (datos) {
+  function confirmarCancelarReservaConductor(viajeId, pasajeroId) {
+    if (!window.confirm('¿Cancelar toda la reserva de este pasajero en el viaje? Se le notificará.')) return;
+    api('/viajes/' + viajeId + '/pasajeros/' + pasajeroId + '/cancelar', { method: 'PATCH' }).then(function (datos) {
       mostrarToast(datos.mensaje, 'exito');
-      if (viajeIdAfectado) {
-        api('/viajes/' + viajeIdAfectado + '/reservas', { method: 'GET' }).then(function (datosDetalle) {
-          estado.detallePasajeros[viajeIdAfectado] = datosDetalle.reservas;
-          render();
-        });
-      }
+      api('/viajes/' + viajeId + '/reservas', { method: 'GET' }).then(function (datosDetalle) {
+        estado.detallePasajeros[viajeId] = datosDetalle.reservas;
+        render();
+      });
       cargarMisViajes(false);
     }).catch(function (err) {
       mostrarToast(err.message, 'error');
@@ -3007,7 +3077,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
     else if (accion === 'abrir-modal-reserva') { abrirModalReserva(id); }
     else if (accion === 'cerrar-modal') { estado.modalViajeId = null; render(); }
     else if (accion === 'cancelar-reserva') { confirmarCancelarReserva(id, Number(el.getAttribute('data-total')) || 1); }
-    else if (accion === 'cancelar-reserva-conductor') { confirmarCancelarReservaConductor(id, Number(el.getAttribute('data-total')) || 1); }
+    else if (accion === 'cancelar-reserva-conductor') { confirmarCancelarReservaConductor(el.getAttribute('data-viaje'), el.getAttribute('data-pasajero')); }
     else if (accion === 'activar-notificaciones') { activarNotificaciones(); }
     else if (accion === 'avisar-cupo') { pedirAvisoCupo(id); }
     else if (accion === 'quitar-aviso-cupo') { quitarAvisoCupo(id); }
