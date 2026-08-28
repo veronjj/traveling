@@ -426,6 +426,51 @@ async function enviarNotificacionAUsuario(usuarioId, payload) {
   }
 }
 
+/**
+ * Trae nombre y datos del vehículo de un conductor, para incluirlos en el
+ * mensaje de "hay cupo disponible" que reciben los pasajeros interesados.
+ */
+async function obtenerInfoConductor(conductorId) {
+  const [filas] = await pool.query(
+    'SELECT nombre, vehiculo_modelo, vehiculo_placa FROM usuarios WHERE id = ? LIMIT 1',
+    [conductorId]
+  );
+  return filas[0] || null;
+}
+
+/**
+ * Notifica a todos los pasajeros que pidieron "avisarme si hay cupo" en un
+ * viaje, incluyendo el conductor y el vehículo en el mensaje.
+ */
+async function avisarCupoDisponible(viaje) {
+  const [interesados] = await pool.query('SELECT pasajero_id FROM avisos_cupo WHERE viaje_id = ?', [viaje.id]);
+  if (interesados.length === 0) return;
+
+  const conductor = await obtenerInfoConductor(viaje.conductor_id);
+  const detalleConductor = conductor
+    ? ` Te lleva ${conductor.nombre} en ${conductor.vehiculo_modelo} (placa ${conductor.vehiculo_placa}).`
+    : '';
+
+  for (const interesado of interesados) {
+    enviarNotificacionAUsuario(interesado.pasajero_id, {
+      titulo: '¡Hay cupo disponible!',
+      cuerpo: `Se liberó un puesto en ${viaje.origen} → ${viaje.destino} del ${formatearFechaLegible(viaje.fecha_salida)} a las ${viaje.hora_salida.slice(0, 5)}.${detalleConductor}`,
+      url: '/',
+    });
+  }
+}
+
+function formatearFechaLegible(fechaISO) {
+  try {
+    const [anio, mes, dia] = fechaISO.split('-');
+    const nombresDias = ['domingo', 'lunes', 'martes', 'miércoles', 'jueves', 'viernes', 'sábado'];
+    const fecha = new Date(Number(anio), Number(mes) - 1, Number(dia));
+    return nombresDias[fecha.getDay()] + ' ' + dia + '/' + mes;
+  } catch (err) {
+    return fechaISO;
+  }
+}
+
 // -----------------------------------------------------------------------------
 // 6. RUTAS API — AUTENTICACIÓN
 // -----------------------------------------------------------------------------
@@ -976,14 +1021,7 @@ app.patch('/api/viajes/:id/pasajeros/:pasajeroId/cancelar', autenticar, requiere
     });
 
     if (seLiberoCupo) {
-      const [interesados] = await pool.query('SELECT pasajero_id FROM avisos_cupo WHERE viaje_id = ?', [viaje.id]);
-      for (const interesado of interesados) {
-        enviarNotificacionAUsuario(interesado.pasajero_id, {
-          titulo: '¡Hay cupo disponible!',
-          cuerpo: `Se liberó un puesto en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
-          url: '/',
-        });
-      }
+      avisarCupoDisponible(viaje);
     }
   } catch (err) {
     await conexion.rollback();
@@ -1203,95 +1241,7 @@ app.patch('/api/reservas/:id/cancelar', autenticar, requiereRol('pasajero'), man
 
     // Avisa a quienes pidieron que les avisaran de cupo en este viaje.
     if (seLiberoCupo) {
-      const [interesados] = await pool.query('SELECT pasajero_id FROM avisos_cupo WHERE viaje_id = ?', [viaje.id]);
-      for (const interesado of interesados) {
-        enviarNotificacionAUsuario(interesado.pasajero_id, {
-          titulo: '¡Hay cupo disponible!',
-          cuerpo: `Se liberó un puesto en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
-          url: '/',
-        });
-      }
-    }
-  } catch (err) {
-    await conexion.rollback();
-    throw err;
-  } finally {
-    conexion.release();
-  }
-}));
-
-app.patch('/api/reservas/:id/cancelar-conductor', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
-  const id = Number(req.params.id);
-  if (!enteroPositivo(id)) return res.status(400).json({ ok: false, mensaje: 'Reserva inválida.' });
-
-  const conexion = await pool.getConnection();
-  try {
-    await conexion.beginTransaction();
-
-    const [filasReserva] = await conexion.query('SELECT * FROM reservas WHERE id = ? FOR UPDATE', [id]);
-    const reserva = filasReserva[0];
-    if (!reserva) {
-      await conexion.rollback();
-      return res.status(404).json({ ok: false, mensaje: 'Esa reserva no existe.' });
-    }
-
-    const [filasViaje] = await conexion.query('SELECT * FROM viajes WHERE id = ? FOR UPDATE', [reserva.viaje_id]);
-    const viaje = filasViaje[0];
-    if (!viaje || viaje.conductor_id !== req.usuario.id) {
-      await conexion.rollback();
-      return res.status(403).json({ ok: false, mensaje: 'Esa reserva no pertenece a uno de tus viajes.' });
-    }
-    if (reserva.estado !== 'confirmada') {
-      await conexion.rollback();
-      return res.status(400).json({ ok: false, mensaje: 'Esa reserva ya estaba cancelada.' });
-    }
-
-    const resuelto = resolverPuestosACancelar(req.body || {}, reserva);
-    if (resuelto.error) {
-      await conexion.rollback();
-      return res.status(400).json({ ok: false, mensaje: resuelto.error });
-    }
-    const puestosACancelar = resuelto.cantidad;
-    const puestosRestantes = reserva.puestos_reservados - puestosACancelar;
-
-    if (puestosRestantes > 0) {
-      await conexion.query('UPDATE reservas SET puestos_reservados = ? WHERE id = ?', [puestosRestantes, id]);
-    } else {
-      await conexion.query("UPDATE reservas SET estado = 'cancelada' WHERE id = ?", [id]);
-    }
-
-    let seLiberoCupo = false;
-    if (viaje.estado === 'activo') {
-      const restaurados = Math.min(viaje.puestos_totales, viaje.puestos_disponibles + puestosACancelar);
-      await conexion.query('UPDATE viajes SET puestos_disponibles = ? WHERE id = ?', [restaurados, viaje.id]);
-      seLiberoCupo = restaurados > 0;
-    }
-
-    await conexion.commit();
-    const mensajeExito = puestosRestantes > 0
-      ? `Cancelaste ${puestosACancelar} de los ${reserva.puestos_reservados} puesto(s) de ese pasajero.`
-      : 'Reserva del pasajero cancelada correctamente.';
-    res.json({ ok: true, mensaje: mensajeExito });
-
-    // Avisa al pasajero de que el conductor canceló (parte de) su reserva.
-    enviarNotificacionAUsuario(reserva.pasajero_id, {
-      titulo: puestosRestantes > 0 ? 'Se canceló parte de tu reserva' : 'Tu reserva fue cancelada',
-      cuerpo: puestosRestantes > 0
-        ? `El conductor canceló ${puestosACancelar} puesto(s) de tu reserva en ${viaje.origen} → ${viaje.destino}. Te quedan ${puestosRestantes}.`
-        : `El conductor canceló tu reserva en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
-      url: '/',
-    });
-
-    // Avisa a quienes pidieron que les avisaran de cupo en este viaje.
-    if (seLiberoCupo) {
-      const [interesados] = await pool.query('SELECT pasajero_id FROM avisos_cupo WHERE viaje_id = ?', [viaje.id]);
-      for (const interesado of interesados) {
-        enviarNotificacionAUsuario(interesado.pasajero_id, {
-          titulo: '¡Hay cupo disponible!',
-          cuerpo: `Se liberó un puesto en el viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
-          url: '/',
-        });
-      }
+      avisarCupoDisponible(viaje);
     }
   } catch (err) {
     await conexion.rollback();
@@ -1573,6 +1523,12 @@ const PAGINA_HTML = `<!DOCTYPE html>
   .chip-alerta { color: #FFF3D6; background-color: rgba(212,175,94,0.3); animation: chip-parpadeo 1.6s ease-in-out infinite; }
   .chip-alerta:hover { animation-play-state: paused; background-color: rgba(212,175,94,0.5); }
 
+  @keyframes texto-parpadeo {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+  .texto-parpadeo { animation: texto-parpadeo 1.3s ease-in-out infinite; }
+
   .insignia {
     display: inline-flex;
     align-items: center;
@@ -1697,7 +1653,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
     return p.join('');
   }
 
-  function mostrarToast(mensaje, tipo) {
+  function mostrarToast(mensaje, tipo, duracionMs) {
     var contenedor = document.getElementById('toasts');
     if (!contenedor) return;
     var estilos = {
@@ -1716,7 +1672,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
       toast.style.opacity = '0';
       toast.style.transform = 'translateY(-6px)';
       setTimeout(function () { toast.remove(); }, 260);
-    }, 3200);
+    }, duracionMs || 3200);
   }
 
   function api(ruta, opciones) {
@@ -2424,7 +2380,8 @@ const PAGINA_HTML = `<!DOCTYPE html>
         p.push('    </div>');
         p.push('    <div class="text-right shrink-0">');
         if (!v.pico_y_placa) {
-          p.push('      <p class="font-display font-bold text-travel-accent text-lg">' + v.puestos_disponibles + ' puesto(s) libre(s)</p>');
+          var seEstaLlenando = v.puestos_disponibles > 0 && v.puestos_disponibles < v.puestos_totales;
+          p.push('      <p class="font-display font-bold text-travel-accent text-lg' + (seEstaLlenando ? ' texto-parpadeo' : '') + '">' + v.puestos_disponibles + ' puesto(s) libre(s)</p>');
         }
         p.push('      <p class="text-xs text-travel-muted mt-0.5">' + formatearPrecio(v.precio) + '</p>');
         p.push('    </div>');
@@ -3150,7 +3107,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
       if (event.data && event.data.tipo === 'notificacion-push') {
         reproducirSonidoAviso();
         var carga = event.data.payload || {};
-        mostrarToast(carga.cuerpo || carga.titulo || 'Tienes una novedad en Traveling.', 'info');
+        mostrarToast(carga.cuerpo || carga.titulo || 'Tienes una novedad en Traveling.', 'info', 9000);
         if (estado.usuario && estado.usuario.rol === 'conductor' && estado.conductorTab === 'mis-viajes') {
           cargarMisViajes(false);
           refrescarDetallePasajerosAbiertos();
