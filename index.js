@@ -820,7 +820,8 @@ app.get('/api/viajes/mios', autenticar, requiereRol('conductor'), manejadorAsinc
 app.get('/api/viajes/historial', autenticar, requiereRol('conductor'), manejadorAsincrono(async (req, res) => {
   const sql =
     'SELECT v.*, ' +
-    '  (SELECT COALESCE(SUM(r.puestos_reservados),0) FROM reservas r WHERE r.viaje_id = v.id AND r.estado = "confirmada") AS reservas_confirmadas ' +
+    '  (SELECT COALESCE(SUM(r.puestos_reservados),0) FROM reservas r WHERE r.viaje_id = v.id AND r.estado = "confirmada") AS reservas_confirmadas, ' +
+    '  (SELECT COALESCE(SUM(r.puestos_reservados),0) FROM reservas r WHERE r.viaje_id = v.id) AS reservas_totales ' +
     "FROM viajes v WHERE v.conductor_id = ? AND v.estado IN ('completado','cancelado') " +
     'ORDER BY v.fecha_salida DESC, v.hora_salida DESC ' +
     'LIMIT 200';
@@ -954,14 +955,21 @@ app.get('/api/viajes/:id/reservas', autenticar, requiereRol('conductor'), maneja
     return res.status(403).json({ ok: false, mensaje: 'No puedes ver las reservas de un viaje que no publicaste.' });
   }
 
+  // En un viaje activo solo interesa quién va confirmado (para el recorrido
+  // de hoy). En el historial (completado o cancelado) se muestran también
+  // los que cancelaron, para que quede la trazabilidad completa de quién
+  // reservó ese viaje, aunque ya no vaya a viajar.
+  const soloConfirmados = viaje.estado === 'activo';
+  const filtroEstado = soloConfirmados ? "AND r.estado = 'confirmada'" : '';
+
   const sql =
-    'SELECT r.pasajero_id, u.nombre AS pasajero_nombre, u.telefono AS pasajero_telefono, ' +
+    'SELECT r.pasajero_id, u.nombre AS pasajero_nombre, u.telefono AS pasajero_telefono, r.estado, ' +
     '       SUM(r.puestos_reservados) AS puestos_totales, ' +
     "       GROUP_CONCAT(r.punto_recogida SEPARATOR ' · ') AS puntos_recogida, " +
     '       COUNT(*) AS num_reservas, MIN(r.creado_en) AS creado_en ' +
     'FROM reservas r JOIN usuarios u ON r.pasajero_id = u.id ' +
-    "WHERE r.viaje_id = ? AND r.estado = 'confirmada' " +
-    'GROUP BY r.pasajero_id, u.nombre, u.telefono ' +
+    'WHERE r.viaje_id = ? ' + filtroEstado + ' ' +
+    'GROUP BY r.pasajero_id, r.estado, u.nombre, u.telefono ' +
     'ORDER BY MIN(r.creado_en) ASC';
   const [filas] = await pool.query(sql, [id]);
   res.json({ ok: true, reservas: filas });
@@ -1239,6 +1247,16 @@ app.patch('/api/reservas/:id/cancelar', autenticar, requiereRol('pasajero'), man
       : 'Reserva cancelada correctamente.';
     res.json({ ok: true, mensaje: mensajeExito });
 
+    // Avisa al conductor de que un pasajero canceló, para que lo vea reflejado
+    // de inmediato en "Mis viajes" sin tener que refrescar manualmente.
+    if (viaje) {
+      enviarNotificacionAUsuario(viaje.conductor_id, {
+        titulo: puestosRestantes > 0 ? 'Un pasajero canceló parte de su reserva' : 'Un pasajero canceló su reserva',
+        cuerpo: `${req.usuario.nombre} canceló ${puestosACancelar} puesto(s) en tu viaje ${viaje.origen} → ${viaje.destino} del ${viaje.fecha_salida}.`,
+        url: '/',
+      });
+    }
+
     // Avisa a quienes pidieron que les avisaran de cupo en este viaje.
     if (seLiberoCupo) {
       avisarCupoDisponible(viaje);
@@ -1310,7 +1328,7 @@ app.delete('/api/viajes/:id/avisar-cupo', autenticar, requiereRol('pasajero'), m
 // regenerarlo. Esto evita que la app se vea rota cuando el navegador del
 // visitante bloquea o no logra cargar un script externo (redes corporativas,
 // bloqueadores de anuncios, conexiones lentas, etc.).
-const TAILWIND_CSS_ESTATICO = `*,:after,:before{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/*! tailwindcss v3.4.19 | MIT License | https://tailwindcss.com*/*,:after,:before{box-sizing:border-box;border:0 solid #e5e7eb}:after,:before{--tw-content:""}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;-o-tab-size:4;tab-size:4;font-family:ui-sans-serif,system-ui,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{opacity:1;color:#9ca3af}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.sticky{position:sticky}.inset-0{inset:0}.left-4{left:1rem}.right-4{right:1rem}.top-0{top:0}.top-4{top:1rem}.z-30{z-index:30}.z-40{z-index:40}.z-50{z-index:50}.mx-auto{margin-left:auto;margin-right:auto}.my-1{margin-top:.25rem;margin-bottom:.25rem}.my-5{margin-top:1.25rem;margin-bottom:1.25rem}.mb-1{margin-bottom:.25rem}.mb-10{margin-bottom:2.5rem}.mb-2{margin-bottom:.5rem}.mb-3{margin-bottom:.75rem}.mb-4{margin-bottom:1rem}.mb-6{margin-bottom:1.5rem}.mt-0\\.5{margin-top:.125rem}.mt-1{margin-top:.25rem}.mt-2{margin-top:.5rem}.mt-3{margin-top:.75rem}.mt-4{margin-top:1rem}.mt-6{margin-top:1.5rem}.mt-7{margin-top:1.75rem}.block{display:block}.flex{display:flex}.grid{display:grid}.hidden{display:none}.h-8{height:2rem}.h-9{height:2.25rem}.h-px{height:1px}.min-h-screen{min-height:100vh}.w-8{width:2rem}.w-9{width:2.25rem}.w-full{width:100%}.max-w-3xl{max-width:48rem}.max-w-5xl{max-width:64rem}.max-w-lg{max-width:32rem}.max-w-md{max-width:28rem}.max-w-xs{max-width:20rem}.flex-1{flex:1 1 0%}.flex-shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.cursor-pointer{cursor:pointer}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.gap-1\\.5{gap:.375rem}.gap-2{gap:.5rem}.gap-2\\.5{gap:.625rem}.gap-3{gap:.75rem}.gap-4{gap:1rem}.gap-7{gap:1.75rem}.overflow-y-auto{overflow-y:auto}.whitespace-nowrap{white-space:nowrap}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5rem}.rounded-xl{border-radius:.75rem}.rounded-t-3xl{border-top-left-radius:1.5rem;border-top-right-radius:1.5rem}.border{border-width:1px}.border-2{border-width:2px}.border-b{border-bottom-width:1px}.border-t{border-top-width:1px}.border-travel-accent{--tw-border-opacity:1;border-color:rgb(212 175 94/var(--tw-border-opacity,1))}.border-travel-line{border-color:hsla(0,0%,100%,.1)}.bg-black\\/70{background-color:rgba(0,0,0,.7)}.bg-travel-accent\\/10{background-color:rgba(212,175,94,.1)}.bg-travel-bg{--tw-bg-opacity:1;background-color:rgb(10 13 20/var(--tw-bg-opacity,1))}.bg-travel-danger\\/10{background-color:hsla(6,83%,65%,.1)}.bg-travel-line{background-color:hsla(0,0%,100%,.1)}.bg-travel-muted\\/10{background-color:rgba(154,161,177,.1)}.bg-travel-success\\/10{background-color:rgba(63,207,142,.1)}.bg-white\\/10{background-color:hsla(0,0%,100%,.1)}.p-3{padding:.75rem}.p-4{padding:1rem}.p-5{padding:1.25rem}.p-6{padding:1.5rem}.px-0{padding-left:0;padding-right:0}.px-3{padding-left:.75rem;padding-right:.75rem}.px-4{padding-left:1rem;padding-right:1rem}.py-12{padding-top:3rem;padding-bottom:3rem}.py-16{padding-top:4rem;padding-bottom:4rem}.py-2{padding-top:.5rem;padding-bottom:.5rem}.py-2\\.5{padding-top:.625rem;padding-bottom:.625rem}.py-24{padding-top:6rem;padding-bottom:6rem}.py-3{padding-top:.75rem;padding-bottom:.75rem}.py-4{padding-top:1rem;padding-bottom:1rem}.py-6{padding-top:1.5rem;padding-bottom:1.5rem}.pt-3{padding-top:.75rem}.pt-4{padding-top:1rem}.text-center{text-align:center}.text-right{text-align:right}.font-display{font-family:Space Grotesk,sans-serif}.text-4xl{font-size:2.25rem;line-height:2.5rem}.text-\\[15px\\]{font-size:15px}.text-base{font-size:1rem;line-height:1.5rem}.text-lg{font-size:1.125rem;line-height:1.75rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.text-xs{font-size:.75rem;line-height:1rem}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-normal{font-weight:400}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.leading-none{line-height:1}.leading-tight{line-height:1.25}.tracking-tight{letter-spacing:-.025em}.tracking-wide{letter-spacing:.025em}.text-travel-accent{--tw-text-opacity:1;color:rgb(212 175 94/var(--tw-text-opacity,1))}.text-travel-danger{--tw-text-opacity:1;color:rgb(240 104 90/var(--tw-text-opacity,1))}.text-travel-ink{--tw-text-opacity:1;color:rgb(243 244 246/var(--tw-text-opacity,1))}.text-travel-muted{--tw-text-opacity:1;color:rgb(154 161 177/var(--tw-text-opacity,1))}.text-travel-primarydark{--tw-text-opacity:1;color:rgb(27 34 51/var(--tw-text-opacity,1))}.text-travel-success{--tw-text-opacity:1;color:rgb(63 207 142/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-white\\/85{color:hsla(0,0%,100%,.85)}.opacity-90{opacity:.9}.shadow-lift{--tw-shadow:0 16px 36px -14px rgba(0,0,0,.7);--tw-shadow-colored:0 16px 36px -14px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.outline{outline-style:solid}.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-in-out{transition-timing-function:cubic-bezier(.4,0,.2,1)}.hover\\:bg-white\\/20:hover{background-color:hsla(0,0%,100%,.2)}.hover\\:text-travel-ink:hover{--tw-text-opacity:1;color:rgb(243 244 246/var(--tw-text-opacity,1))}.hover\\:text-white:hover{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.hover\\:opacity-90:hover{opacity:.9}.peer:checked~.peer-checked\\:border-travel-danger{--tw-border-opacity:1;border-color:rgb(240 104 90/var(--tw-border-opacity,1))}.peer:checked~.peer-checked\\:border-travel-primary{--tw-border-opacity:1;border-color:rgb(42 53 72/var(--tw-border-opacity,1))}.peer:checked~.peer-checked\\:bg-travel-danger{--tw-bg-opacity:1;background-color:rgb(240 104 90/var(--tw-bg-opacity,1))}.peer:checked~.peer-checked\\:bg-travel-primary{--tw-bg-opacity:1;background-color:rgb(42 53 72/var(--tw-bg-opacity,1))}.peer:checked~.peer-checked\\:text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\\:left-auto{left:auto}.sm\\:flex{display:flex}.sm\\:w-48{width:12rem}.sm\\:max-w-md{max-width:28rem}.sm\\:max-w-sm{max-width:24rem}.sm\\:flex-row{flex-direction:row}.sm\\:items-center{align-items:center}.sm\\:gap-3{gap:.75rem}.sm\\:rounded-2xl{border-radius:1rem}.sm\\:p-5{padding:1.25rem}.sm\\:px-4{padding-left:1rem;padding-right:1rem}.sm\\:px-6{padding-left:1.5rem;padding-right:1.5rem}.sm\\:py-20{padding-top:5rem;padding-bottom:5rem}.sm\\:text-sm{font-size:.875rem;line-height:1.25rem}}`;
+const TAILWIND_CSS_ESTATICO = `*,:after,:before{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }::backdrop{--tw-border-spacing-x:0;--tw-border-spacing-y:0;--tw-translate-x:0;--tw-translate-y:0;--tw-rotate:0;--tw-skew-x:0;--tw-skew-y:0;--tw-scale-x:1;--tw-scale-y:1;--tw-pan-x: ;--tw-pan-y: ;--tw-pinch-zoom: ;--tw-scroll-snap-strictness:proximity;--tw-gradient-from-position: ;--tw-gradient-via-position: ;--tw-gradient-to-position: ;--tw-ordinal: ;--tw-slashed-zero: ;--tw-numeric-figure: ;--tw-numeric-spacing: ;--tw-numeric-fraction: ;--tw-ring-inset: ;--tw-ring-offset-width:0px;--tw-ring-offset-color:#fff;--tw-ring-color:rgba(59,130,246,.5);--tw-ring-offset-shadow:0 0 #0000;--tw-ring-shadow:0 0 #0000;--tw-shadow:0 0 #0000;--tw-shadow-colored:0 0 #0000;--tw-blur: ;--tw-brightness: ;--tw-contrast: ;--tw-grayscale: ;--tw-hue-rotate: ;--tw-invert: ;--tw-saturate: ;--tw-sepia: ;--tw-drop-shadow: ;--tw-backdrop-blur: ;--tw-backdrop-brightness: ;--tw-backdrop-contrast: ;--tw-backdrop-grayscale: ;--tw-backdrop-hue-rotate: ;--tw-backdrop-invert: ;--tw-backdrop-opacity: ;--tw-backdrop-saturate: ;--tw-backdrop-sepia: ;--tw-contain-size: ;--tw-contain-layout: ;--tw-contain-paint: ;--tw-contain-style: }/*! tailwindcss v3.4.19 | MIT License | https://tailwindcss.com*/*,:after,:before{box-sizing:border-box;border:0 solid #e5e7eb}:after,:before{--tw-content:""}:host,html{line-height:1.5;-webkit-text-size-adjust:100%;-moz-tab-size:4;-o-tab-size:4;tab-size:4;font-family:ui-sans-serif,system-ui,sans-serif,Apple Color Emoji,Segoe UI Emoji,Segoe UI Symbol,Noto Color Emoji;font-feature-settings:normal;font-variation-settings:normal;-webkit-tap-highlight-color:transparent}body{margin:0;line-height:inherit}hr{height:0;color:inherit;border-top-width:1px}abbr:where([title]){-webkit-text-decoration:underline dotted;text-decoration:underline dotted}h1,h2,h3,h4,h5,h6{font-size:inherit;font-weight:inherit}a{color:inherit;text-decoration:inherit}b,strong{font-weight:bolder}code,kbd,pre,samp{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,Liberation Mono,Courier New,monospace;font-feature-settings:normal;font-variation-settings:normal;font-size:1em}small{font-size:80%}sub,sup{font-size:75%;line-height:0;position:relative;vertical-align:baseline}sub{bottom:-.25em}sup{top:-.5em}table{text-indent:0;border-color:inherit;border-collapse:collapse}button,input,optgroup,select,textarea{font-family:inherit;font-feature-settings:inherit;font-variation-settings:inherit;font-size:100%;font-weight:inherit;line-height:inherit;letter-spacing:inherit;color:inherit;margin:0;padding:0}button,select{text-transform:none}button,input:where([type=button]),input:where([type=reset]),input:where([type=submit]){-webkit-appearance:button;background-color:transparent;background-image:none}:-moz-focusring{outline:auto}:-moz-ui-invalid{box-shadow:none}progress{vertical-align:baseline}::-webkit-inner-spin-button,::-webkit-outer-spin-button{height:auto}[type=search]{-webkit-appearance:textfield;outline-offset:-2px}::-webkit-search-decoration{-webkit-appearance:none}::-webkit-file-upload-button{-webkit-appearance:button;font:inherit}summary{display:list-item}blockquote,dd,dl,figure,h1,h2,h3,h4,h5,h6,hr,p,pre{margin:0}fieldset{margin:0}fieldset,legend{padding:0}menu,ol,ul{list-style:none;margin:0;padding:0}dialog{padding:0}textarea{resize:vertical}input::-moz-placeholder,textarea::-moz-placeholder{opacity:1;color:#9ca3af}input::placeholder,textarea::placeholder{opacity:1;color:#9ca3af}[role=button],button{cursor:pointer}:disabled{cursor:default}audio,canvas,embed,iframe,img,object,svg,video{display:block;vertical-align:middle}img,video{max-width:100%;height:auto}[hidden]:where(:not([hidden=until-found])){display:none}.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0,0,0,0);white-space:nowrap;border-width:0}.pointer-events-none{pointer-events:none}.pointer-events-auto{pointer-events:auto}.fixed{position:fixed}.absolute{position:absolute}.relative{position:relative}.sticky{position:sticky}.inset-0{inset:0}.left-4{left:1rem}.right-4{right:1rem}.top-0{top:0}.top-4{top:1rem}.z-30{z-index:30}.z-40{z-index:40}.z-50{z-index:50}.mx-auto{margin-left:auto;margin-right:auto}.my-1{margin-top:.25rem;margin-bottom:.25rem}.my-5{margin-top:1.25rem;margin-bottom:1.25rem}.mb-1{margin-bottom:.25rem}.mb-10{margin-bottom:2.5rem}.mb-2{margin-bottom:.5rem}.mb-3{margin-bottom:.75rem}.mb-4{margin-bottom:1rem}.mb-6{margin-bottom:1.5rem}.mt-0\.5{margin-top:.125rem}.mt-1{margin-top:.25rem}.mt-2{margin-top:.5rem}.mt-3{margin-top:.75rem}.mt-4{margin-top:1rem}.mt-6{margin-top:1.5rem}.mt-7{margin-top:1.75rem}.block{display:block}.flex{display:flex}.grid{display:grid}.hidden{display:none}.h-8{height:2rem}.h-9{height:2.25rem}.h-px{height:1px}.min-h-screen{min-height:100vh}.w-8{width:2rem}.w-9{width:2.25rem}.w-full{width:100%}.max-w-3xl{max-width:48rem}.max-w-5xl{max-width:64rem}.max-w-lg{max-width:32rem}.max-w-md{max-width:28rem}.max-w-xs{max-width:20rem}.flex-1{flex:1 1 0%}.flex-shrink{flex-shrink:1}.shrink-0{flex-shrink:0}.transform{transform:translate(var(--tw-translate-x),var(--tw-translate-y)) rotate(var(--tw-rotate)) skewX(var(--tw-skew-x)) skewY(var(--tw-skew-y)) scaleX(var(--tw-scale-x)) scaleY(var(--tw-scale-y))}.grid-cols-2{grid-template-columns:repeat(2,minmax(0,1fr))}.flex-col{flex-direction:column}.flex-wrap{flex-wrap:wrap}.items-start{align-items:flex-start}.items-end{align-items:flex-end}.items-center{align-items:center}.justify-center{justify-content:center}.justify-between{justify-content:space-between}.gap-1\.5{gap:.375rem}.gap-2{gap:.5rem}.gap-2\.5{gap:.625rem}.gap-3{gap:.75rem}.gap-4{gap:1rem}.gap-6{gap:1.5rem}.gap-7{gap:1.75rem}.overflow-y-auto{overflow-y:auto}.whitespace-nowrap{white-space:nowrap}.rounded-full{border-radius:9999px}.rounded-lg{border-radius:.5rem}.rounded-xl{border-radius:.75rem}.rounded-t-3xl{border-top-left-radius:1.5rem;border-top-right-radius:1.5rem}.border{border-width:1px}.border-2{border-width:2px}.border-b{border-bottom-width:1px}.border-t{border-top-width:1px}.border-travel-accent{--tw-border-opacity:1;border-color:rgb(212 175 94/var(--tw-border-opacity,1))}.border-travel-line{border-color:hsla(0,0%,100%,.1)}.bg-black\/70{background-color:rgba(0,0,0,.7)}.bg-travel-accent\/10{background-color:rgba(212,175,94,.1)}.bg-travel-bg{--tw-bg-opacity:1;background-color:rgb(10 13 20/var(--tw-bg-opacity,1))}.bg-travel-danger\/10{background-color:hsla(6,83%,65%,.1)}.bg-travel-line{background-color:hsla(0,0%,100%,.1)}.bg-travel-muted\/10{background-color:rgba(154,161,177,.1)}.bg-travel-success\/10{background-color:rgba(63,207,142,.1)}.bg-white\/10{background-color:hsla(0,0%,100%,.1)}.p-3{padding:.75rem}.p-4{padding:1rem}.p-5{padding:1.25rem}.p-6{padding:1.5rem}.px-0{padding-left:0;padding-right:0}.px-3{padding-left:.75rem;padding-right:.75rem}.px-4{padding-left:1rem;padding-right:1rem}.py-12{padding-top:3rem;padding-bottom:3rem}.py-16{padding-top:4rem;padding-bottom:4rem}.py-2{padding-top:.5rem;padding-bottom:.5rem}.py-2\.5{padding-top:.625rem;padding-bottom:.625rem}.py-24{padding-top:6rem;padding-bottom:6rem}.py-3{padding-top:.75rem;padding-bottom:.75rem}.py-4{padding-top:1rem;padding-bottom:1rem}.py-6{padding-top:1.5rem;padding-bottom:1.5rem}.pt-3{padding-top:.75rem}.pt-4{padding-top:1rem}.text-center{text-align:center}.text-right{text-align:right}.font-display{font-family:Space Grotesk,sans-serif}.text-2xl{font-size:1.5rem;line-height:2rem}.text-4xl{font-size:2.25rem;line-height:2.5rem}.text-\[15px\]{font-size:15px}.text-base{font-size:1rem;line-height:1.5rem}.text-lg{font-size:1.125rem;line-height:1.75rem}.text-sm{font-size:.875rem;line-height:1.25rem}.text-xl{font-size:1.25rem;line-height:1.75rem}.text-xs{font-size:.75rem;line-height:1rem}.font-bold{font-weight:700}.font-medium{font-weight:500}.font-normal{font-weight:400}.font-semibold{font-weight:600}.uppercase{text-transform:uppercase}.normal-case{text-transform:none}.leading-none{line-height:1}.leading-tight{line-height:1.25}.tracking-normal{letter-spacing:0}.tracking-tight{letter-spacing:-.025em}.tracking-wide{letter-spacing:.025em}.text-travel-accent{--tw-text-opacity:1;color:rgb(212 175 94/var(--tw-text-opacity,1))}.text-travel-danger{--tw-text-opacity:1;color:rgb(240 104 90/var(--tw-text-opacity,1))}.text-travel-ink{--tw-text-opacity:1;color:rgb(243 244 246/var(--tw-text-opacity,1))}.text-travel-muted{--tw-text-opacity:1;color:rgb(154 161 177/var(--tw-text-opacity,1))}.text-travel-primarydark{--tw-text-opacity:1;color:rgb(27 34 51/var(--tw-text-opacity,1))}.text-travel-success{--tw-text-opacity:1;color:rgb(63 207 142/var(--tw-text-opacity,1))}.text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.text-white\/85{color:hsla(0,0%,100%,.85)}.opacity-60{opacity:.6}.opacity-90{opacity:.9}.shadow-lift{--tw-shadow:0 16px 36px -14px rgba(0,0,0,.7);--tw-shadow-colored:0 16px 36px -14px var(--tw-shadow-color);box-shadow:var(--tw-ring-offset-shadow,0 0 #0000),var(--tw-ring-shadow,0 0 #0000),var(--tw-shadow)}.outline{outline-style:solid}.filter{filter:var(--tw-blur) var(--tw-brightness) var(--tw-contrast) var(--tw-grayscale) var(--tw-hue-rotate) var(--tw-invert) var(--tw-saturate) var(--tw-sepia) var(--tw-drop-shadow)}.transition{transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,-webkit-backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter;transition-property:color,background-color,border-color,text-decoration-color,fill,stroke,opacity,box-shadow,transform,filter,backdrop-filter,-webkit-backdrop-filter;transition-timing-function:cubic-bezier(.4,0,.2,1);transition-duration:.15s}.ease-in-out{transition-timing-function:cubic-bezier(.4,0,.2,1)}.hover\:bg-white\/20:hover{background-color:hsla(0,0%,100%,.2)}.hover\:text-travel-ink:hover{--tw-text-opacity:1;color:rgb(243 244 246/var(--tw-text-opacity,1))}.hover\:text-white:hover{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}.hover\:opacity-90:hover{opacity:.9}.peer:checked~.peer-checked\:border-travel-danger{--tw-border-opacity:1;border-color:rgb(240 104 90/var(--tw-border-opacity,1))}.peer:checked~.peer-checked\:border-travel-primary{--tw-border-opacity:1;border-color:rgb(42 53 72/var(--tw-border-opacity,1))}.peer:checked~.peer-checked\:bg-travel-danger{--tw-bg-opacity:1;background-color:rgb(240 104 90/var(--tw-bg-opacity,1))}.peer:checked~.peer-checked\:bg-travel-primary{--tw-bg-opacity:1;background-color:rgb(42 53 72/var(--tw-bg-opacity,1))}.peer:checked~.peer-checked\:text-white{--tw-text-opacity:1;color:rgb(255 255 255/var(--tw-text-opacity,1))}@media (min-width:640px){.sm\:left-auto{left:auto}.sm\:flex{display:flex}.sm\:w-48{width:12rem}.sm\:max-w-md{max-width:28rem}.sm\:max-w-sm{max-width:24rem}.sm\:flex-row{flex-direction:row}.sm\:items-center{align-items:center}.sm\:gap-3{gap:.75rem}.sm\:rounded-2xl{border-radius:1rem}.sm\:p-5{padding:1.25rem}.sm\:px-4{padding-left:1rem;padding-right:1rem}.sm\:px-6{padding-left:1.5rem;padding-right:1.5rem}.sm\:py-20{padding-top:5rem;padding-bottom:5rem}.sm\:text-sm{font-size:.875rem;line-height:1.25rem}}`;
 
 const SERVICE_WORKER_JS = `self.addEventListener('install', function (event) {
   self.skipWaiting();
@@ -1410,6 +1428,40 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
   .tarjeta-rol { cursor: pointer; }
   .tarjeta-rol input { position: absolute; opacity: 0; pointer-events: none; }
+
+  /* ---------- Selector de días premium (publicar viaje) ---------- */
+
+  .seccion-titulo { display: flex; align-items: center; gap: 0.55rem; margin-bottom: 0.7rem; }
+  .paso-numero {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 1.5rem; height: 1.5rem; border-radius: 999px; flex-shrink: 0;
+    background-color: rgba(212,175,94,0.15); color: #D4AF5E;
+    font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 0.7rem;
+  }
+  .seccion-texto { font-size: 0.75rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: #C7CBD4; }
+  .seccion-ayuda { font-size: 0.75rem; color: #767D8C; margin: -0.35rem 0 0.7rem 2.05rem; }
+
+  .selector-dias { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  .dia-opcion { cursor: pointer; }
+  .dia-opcion input { position: absolute; opacity: 0; pointer-events: none; }
+  .dia-opcion-visual {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    width: 3.1rem; height: 3.7rem; border-radius: 1rem; gap: 0.2rem;
+    border: 1.5px solid rgba(255,255,255,0.1); background-color: #141926; color: #9AA1B1;
+    transition: transform 0.18s cubic-bezier(0.16,1,0.3,1), background-color 0.18s ease, border-color 0.18s ease, box-shadow 0.18s ease, color 0.18s ease;
+  }
+  .dia-opcion-visual .dia-letra { font-family: 'Space Grotesk', sans-serif; font-weight: 700; font-size: 1.05rem; line-height: 1; }
+  .dia-opcion-visual .dia-nombre { font-size: 0.6rem; text-transform: uppercase; letter-spacing: 0.04em; opacity: 0.75; }
+  .dia-opcion:hover .dia-opcion-visual { border-color: rgba(255,255,255,0.28); }
+  .dia-opcion input:checked + .dia-opcion-visual { transform: translateY(-3px) scale(1.05); }
+  .dia-opcion.dia-circula input:checked + .dia-opcion-visual {
+    background: linear-gradient(135deg, #E3C177, #B8902F); border-color: transparent; color: #1B1206;
+    box-shadow: 0 10px 22px -10px rgba(212,175,94,0.6);
+  }
+  .dia-opcion.dia-restriccion input:checked + .dia-opcion-visual {
+    background: linear-gradient(135deg, #F0685A, #B93B2E); border-color: transparent; color: #2B0A06;
+    box-shadow: 0 10px 22px -10px rgba(240,104,90,0.55);
+  }
 
   /* ---------- Sistema de componentes premium (tema oscuro) ---------- */
 
@@ -1613,16 +1665,18 @@ const PAGINA_HTML = `<!DOCTYPE html>
     return hoy.getFullYear() + '-' + mes + '-' + dia;
   }
 
-  function casillasDias(nombreCampo, colorTailwind) {
+  function casillasDias(nombreCampo, variante) {
     var codigos = ['LUN', 'MAR', 'MIE', 'JUE', 'VIE', 'SAB', 'DOM'];
-    var etiquetas = { LUN: 'L', MAR: 'M', MIE: 'X', JUE: 'J', VIE: 'V', SAB: 'S', DOM: 'D' };
+    var letras = { LUN: 'L', MAR: 'M', MIE: 'X', JUE: 'J', VIE: 'V', SAB: 'S', DOM: 'D' };
+    var nombres = { LUN: 'Lun', MAR: 'Mar', MIE: 'Mié', JUE: 'Jue', VIE: 'Vie', SAB: 'Sáb', DOM: 'Dom' };
+    var claseVariante = variante === 'restriccion' ? 'dia-restriccion' : 'dia-circula';
     var p = [];
-    p.push('<div class="flex gap-1.5 flex-wrap">');
+    p.push('<div class="selector-dias">');
     for (var i = 0; i < codigos.length; i++) {
       var codigo = codigos[i];
-      p.push('<label class="cursor-pointer" title="' + codigo + '">');
-      p.push('  <input type="checkbox" name="' + nombreCampo + '" value="' + codigo + '" class="peer sr-only">');
-      p.push('  <span class="flex items-center justify-center w-9 h-9 rounded-full border border-travel-line text-sm font-semibold text-travel-muted transition peer-checked:bg-' + colorTailwind + ' peer-checked:text-white peer-checked:border-' + colorTailwind + '">' + etiquetas[codigo] + '</span>');
+      p.push('<label class="dia-opcion ' + claseVariante + '" title="' + nombres[codigo] + '">');
+      p.push('  <input type="checkbox" name="' + nombreCampo + '" value="' + codigo + '" class="sr-only">');
+      p.push('  <span class="dia-opcion-visual"><span class="dia-letra">' + letras[codigo] + '</span><span class="dia-nombre">' + nombres[codigo] + '</span></span>');
       p.push('</label>');
     }
     p.push('</div>');
@@ -2025,42 +2079,59 @@ const PAGINA_HTML = `<!DOCTYPE html>
 
   function formularioPublicarViaje() {
     var p = [];
-    p.push('<form id="form-publicar-viaje" class="tarjeta p-6 flex flex-col gap-4 max-w-lg">');
-    p.push('  <div class="grid grid-cols-2 gap-3">');
-    p.push('    <div>');
-    p.push('      <label class="etiqueta">Origen</label>');
-    p.push('      <input type="text" name="origen" required minlength="2" maxlength="150" placeholder="Ej. Medellín" class="campo">');
-    p.push('    </div>');
-    p.push('    <div>');
-    p.push('      <label class="etiqueta">Destino</label>');
-    p.push('      <input type="text" name="destino" required minlength="2" maxlength="150" placeholder="Ej. Bogotá" class="campo">');
-    p.push('    </div>');
-    p.push('  </div>');
+    p.push('<div class="mb-6">');
+    p.push('  <span class="insignia" style="background-color: rgba(212,175,94,0.14); color: #D4AF5E;">✦ Nuevo viaje</span>');
+    p.push('  <h2 class="fuente-display text-2xl font-bold text-travel-ink mt-3">Publica tu ruta</h2>');
+    p.push('  <p class="text-travel-muted text-sm mt-1">Se genera automáticamente cada salida de esta semana en los días que elijas.</p>');
+    p.push('</div>');
+
+    p.push('<form id="form-publicar-viaje" class="tarjeta p-6 flex flex-col gap-6 max-w-lg">');
+
     p.push('  <div>');
-    p.push('    <label class="etiqueta">Hora de salida</label>');
-    p.push('    <input type="time" name="hora_salida" required class="w-full sm:w-48 rounded-xl border border-travel-line px-4 py-2.5 text-sm">');
-    p.push('  </div>');
-    p.push('  <div>');
-    p.push('    <label class="etiqueta">¿Qué días de la semana circulas?</label>');
-    p.push('    <p class="text-xs text-travel-muted mb-2">Se publican las salidas de esta semana (domingo a sábado) en esos días. La próxima semana debes volver a publicar.</p>');
-    p.push(casillasDias('dias_semana', 'travel-primary'));
-    p.push('  </div>');
-    p.push('  <div>');
-    p.push('    <label class="etiqueta">¿Tienes pico y placa? <span class="font-normal text-travel-muted">(opcional)</span></label>');
-    p.push('    <p class="text-xs text-travel-muted mb-2">Marca el día que tu vehículo no puede circular. Los pasajeros lo verán marcado como "EN PICO Y PLACA".</p>');
-    p.push(casillasDias('pico_placa_dias', 'travel-danger'));
-    p.push('  </div>');
-    p.push('  <div class="grid grid-cols-2 gap-3">');
-    p.push('    <div>');
-    p.push('      <label class="etiqueta">Puestos disponibles</label>');
-    p.push('      <input type="number" name="puestos_disponibles" required min="1" max="' + (estado.usuario.capacidad_puestos || 20) + '" placeholder="Ej. 3" class="campo">');
+    p.push('    <div class="seccion-titulo"><span class="paso-numero">1</span><span class="seccion-texto">Ruta y horario</span></div>');
+    p.push('    <div class="grid grid-cols-2 gap-3">');
+    p.push('      <div>');
+    p.push('        <label class="etiqueta">Origen</label>');
+    p.push('        <input type="text" name="origen" required minlength="2" maxlength="150" placeholder="Ej. Medellín" class="campo">');
+    p.push('      </div>');
+    p.push('      <div>');
+    p.push('        <label class="etiqueta">Destino</label>');
+    p.push('        <input type="text" name="destino" required minlength="2" maxlength="150" placeholder="Ej. Bogotá" class="campo">');
+    p.push('      </div>');
     p.push('    </div>');
-    p.push('    <div>');
-    p.push('      <label class="etiqueta">Precio por puesto (COP)</label>');
-    p.push('      <input type="number" name="precio" required min="0" step="1000" placeholder="Ej. 35000" class="campo">');
+    p.push('    <div class="mt-3">');
+    p.push('      <label class="etiqueta">Hora de salida</label>');
+    p.push('      <input type="time" name="hora_salida" required class="campo sm:w-48">');
     p.push('    </div>');
     p.push('  </div>');
-    p.push('  <button type="submit" class="mt-2 btn btn-accent">Publicar viaje</button>');
+
+    p.push('  <div>');
+    p.push('    <div class="seccion-titulo"><span class="paso-numero">2</span><span class="seccion-texto">Días de circulación</span></div>');
+    p.push('    <p class="seccion-ayuda">Se publican las salidas de esta semana (domingo a sábado) en esos días. La próxima semana vuelves a publicar.</p>');
+    p.push(casillasDias('dias_semana', 'circula'));
+    p.push('  </div>');
+
+    p.push('  <div>');
+    p.push('    <div class="seccion-titulo"><span class="paso-numero">3</span><span class="seccion-texto">Pico y placa <span class="normal-case font-normal tracking-normal text-travel-muted">(opcional)</span></span></div>');
+    p.push('    <p class="seccion-ayuda">Marca el día que tu vehículo no circula. Los pasajeros lo verán como "EN PICO Y PLACA".</p>');
+    p.push(casillasDias('pico_placa_dias', 'restriccion'));
+    p.push('  </div>');
+
+    p.push('  <div>');
+    p.push('    <div class="seccion-titulo"><span class="paso-numero">4</span><span class="seccion-texto">Puestos y precio</span></div>');
+    p.push('    <div class="grid grid-cols-2 gap-3">');
+    p.push('      <div>');
+    p.push('        <label class="etiqueta">Puestos disponibles</label>');
+    p.push('        <input type="number" name="puestos_disponibles" required min="1" max="' + (estado.usuario.capacidad_puestos || 20) + '" placeholder="Ej. 3" class="campo">');
+    p.push('      </div>');
+    p.push('      <div>');
+    p.push('        <label class="etiqueta">Precio por puesto (COP)</label>');
+    p.push('        <input type="number" name="precio" required min="0" step="1000" placeholder="Ej. 35000" class="campo">');
+    p.push('      </div>');
+    p.push('    </div>');
+    p.push('  </div>');
+
+    p.push('  <button type="submit" class="btn btn-accent">Publicar viaje</button>');
     p.push('</form>');
     return p.join('');
   }
@@ -2192,7 +2263,7 @@ const PAGINA_HTML = `<!DOCTYPE html>
       p.push('    </div>');
       p.push('  </div>');
       p.push('  <div class="flex items-center gap-2 mt-4">');
-      p.push('    <button data-action="ver-pasajeros" data-id="' + v.id + '" class="chip chip-primary">' + (expandido ? 'Ocultar pasajeros' : 'Ver pasajeros (' + (v.reservas_confirmadas || 0) + ')') + '</button>');
+      p.push('    <button data-action="ver-pasajeros" data-id="' + v.id + '" class="chip chip-primary">' + (expandido ? 'Ocultar pasajeros' : 'Ver pasajeros (' + (v.reservas_totales || 0) + ')') + '</button>');
       p.push('    <button data-action="eliminar-viaje-historial" data-id="' + v.id + '" class="chip chip-danger">Eliminar</button>');
       p.push('  </div>');
       if (expandido) {
@@ -2259,15 +2330,23 @@ const PAGINA_HTML = `<!DOCTYPE html>
     p.push('<div class="flex flex-col gap-3">');
     for (var i = 0; i < lista.length; i++) {
       var r = lista[i];
+      var cancelada = r.estado === 'cancelada';
       var notaReservas = r.num_reservas > 1 ? ' (' + r.num_reservas + ' reservas)' : '';
-      p.push('<div class="flex items-start justify-between gap-3 bg-travel-bg rounded-xl p-3">');
+      p.push('<div class="flex items-start justify-between gap-3 bg-travel-bg rounded-xl p-3' + (cancelada ? ' opacity-60' : '') + '">');
       p.push('  <div>');
-      p.push('    <p class="text-sm font-semibold text-travel-ink">' + escaparHTML(r.pasajero_nombre) + ' · ' + r.puestos_totales + ' puesto(s)' + notaReservas + '</p>');
+      p.push('    <div class="flex items-center gap-2 flex-wrap">');
+      p.push('      <p class="text-sm font-semibold text-travel-ink">' + escaparHTML(r.pasajero_nombre) + ' · ' + r.puestos_totales + ' puesto(s)' + notaReservas + '</p>');
+      if (cancelada) {
+        p.push('      <span class="insignia bg-travel-danger/10 text-travel-danger">Canceló</span>');
+      }
+      p.push('    </div>');
       p.push('    <p class="text-xs text-travel-muted mt-0.5">Recogida: ' + escaparHTML(r.puntos_recogida) + '</p>');
       p.push('  </div>');
       p.push('  <div class="text-right shrink-0 flex flex-col items-end gap-1.5">');
       p.push('    <a href="tel:' + escaparHTML(r.pasajero_telefono) + '" class="text-xs font-semibold text-travel-accent whitespace-nowrap">' + escaparHTML(r.pasajero_telefono) + '</a>');
-      p.push('    <button data-action="cancelar-reserva-conductor" data-viaje="' + viajeId + '" data-pasajero="' + r.pasajero_id + '" class="chip chip-danger">Cancelar</button>');
+      if (!cancelada) {
+        p.push('    <button data-action="cancelar-reserva-conductor" data-viaje="' + viajeId + '" data-pasajero="' + r.pasajero_id + '" class="chip chip-danger">Cancelar</button>');
+      }
       p.push('  </div>');
       p.push('</div>');
     }
